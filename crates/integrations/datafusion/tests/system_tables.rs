@@ -645,7 +645,7 @@ async fn test_files_system_table() {
             "creation_time",
             DataType::Timestamp(TimeUnit::Millisecond, None),
         ),
-        ("deleteRowCount", DataType::Int64),
+        ("delete_row_count", DataType::Int64),
         ("file_source", DataType::Utf8),
         ("first_row_id", DataType::Int64),
         (

@@ -71,7 +71,7 @@ fn files_schema() -> SchemaRef {
                     ArrowDataType::Timestamp(TimeUnit::Millisecond, None),
                     true,
                 ),
-                Field::new("deleteRowCount", ArrowDataType::Int64, true),
+                Field::new("delete_row_count", ArrowDataType::Int64, true),
                 Field::new("file_source", ArrowDataType::Utf8, true),
                 Field::new("first_row_id", ArrowDataType::Int64, true),
                 Field::new(
