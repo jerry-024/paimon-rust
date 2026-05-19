@@ -21,13 +21,9 @@ mod common;
 
 use std::sync::Arc;
 
-<<<<<<< support_system_files
-use datafusion::arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
-=======
 use datafusion::arrow::array::{
     Array, BooleanArray, Int32Array, Int64Array, ListArray, StringArray,
 };
->>>>>>> main
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use paimon::catalog::Identifier;
