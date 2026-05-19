@@ -177,3 +177,20 @@ def test_register_batch_invalid_catalog():
             assert False, "Expected an error for unknown catalog"
         except Exception as e:
             assert "unknown_catalog" in str(e).lower() or "not a paimon" in str(e).lower() or "unknown" in str(e).lower()
+
+
+def test_table_functions_registered_with_catalog():
+    """register_catalog auto-registers vector_search / full_text_search as
+    UDTFs. Calling one with the wrong argument count surfaces the function's
+    own validation error, which proves it is registered — an unregistered
+    name would instead fail with 'table function not found'."""
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+
+        for fn in ("vector_search", "full_text_search"):
+            try:
+                ctx.sql(f"SELECT * FROM {fn}('only_one_arg')")
+                assert False, f"expected {fn} to reject a single argument"
+            except Exception as e:
+                assert "requires 4 arguments" in str(e), str(e)

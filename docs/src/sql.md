@@ -53,7 +53,7 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`SQLContext::new` creates a session context with the Paimon relation planner pre-registered. Use `register_catalog` to add one or more Paimon catalogs. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
+`SQLContext::new` creates a session context with the Paimon relation planner pre-registered. Use `register_catalog` to add one or more Paimon catalogs; registering a catalog also registers the built-in table-valued functions (`vector_search`, `full_text_search`) against it. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
 ## Data Types
 
@@ -445,6 +445,10 @@ Paimon supports approximate nearest neighbor (ANN) vector search via the Lumina 
 
 ### Registration
 
+When you use a `SQLContext`, `vector_search` is registered automatically for every catalog you register — no extra setup is needed.
+
+With a raw DataFusion `SessionContext`, register it explicitly:
+
 ```rust
 use paimon_datafusion::register_vector_search;
 
@@ -509,6 +513,10 @@ paimon-datafusion = { version = "0.1.0", features = ["fulltext"] }
 ```
 
 ### Registration
+
+When you use a `SQLContext`, `full_text_search` is registered automatically for every catalog you register (when the `fulltext` feature is enabled) — no extra setup is needed.
+
+With a raw DataFusion `SessionContext`, register it explicitly:
 
 ```rust
 use paimon_datafusion::register_full_text_search;

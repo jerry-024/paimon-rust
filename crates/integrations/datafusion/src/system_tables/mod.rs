@@ -39,6 +39,7 @@ mod referenced_files_size;
 mod row_string_cast;
 mod schemas;
 mod snapshots;
+mod table_indexes;
 mod tags;
 
 type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
@@ -55,6 +56,7 @@ const TABLES: &[(&str, Builder)] = &[
     ("referenced_files_size", referenced_files_size::build),
     ("schemas", schemas::build),
     ("snapshots", snapshots::build),
+    ("table_indexes", table_indexes::build),
     ("tags", tags::build),
 ];
 
@@ -68,6 +70,7 @@ const SYSTEM_TABLE_NAMES: &[&str] = &[
     "referenced_files_size",
     "schemas",
     "snapshots",
+    "table_indexes",
     "tags",
 ];
 
@@ -196,6 +199,9 @@ mod tests {
         assert!(is_registered("manifests"));
         assert!(is_registered("Manifests"));
         assert!(is_registered("MANIFESTS"));
+        assert!(is_registered("table_indexes"));
+        assert!(is_registered("Table_Indexes"));
+        assert!(is_registered("TABLE_INDEXES"));
         assert!(is_registered("partitions"));
         assert!(is_registered("Partitions"));
         assert!(is_registered("PARTITIONS"));

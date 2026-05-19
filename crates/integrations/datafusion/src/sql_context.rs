@@ -136,6 +136,7 @@ impl SQLContext {
                 self.dynamic_options.clone(),
             )),
         );
+        register_table_functions(&self.ctx, &catalog, default_db);
         self.catalogs.insert(catalog_name.clone(), catalog);
         if is_first {
             self.set_current_catalog(catalog_name).await?;
@@ -2300,6 +2301,19 @@ fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
     )?;
     let df = ctx.read_batch(batch)?;
     Ok(df)
+}
+
+/// Registers the built-in table-valued functions against `catalog` so they can
+/// be used in SQL without any extra setup call. Called for every catalog
+/// registered on the context; add new built-in table functions here.
+fn register_table_functions(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    default_database: &str,
+) {
+    crate::vector_search::register_vector_search(ctx, Arc::clone(catalog), default_database);
+    #[cfg(feature = "fulltext")]
+    crate::full_text_search::register_full_text_search(ctx, Arc::clone(catalog), default_database);
 }
 
 #[cfg(test)]
