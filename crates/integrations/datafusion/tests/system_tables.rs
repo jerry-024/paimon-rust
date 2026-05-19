@@ -22,7 +22,7 @@ mod common;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
@@ -612,6 +612,99 @@ async fn test_manifests_system_table_partition_stats() {
 
     assert_eq!(min_partition, Some(1));
     assert_eq!(max_partition, Some(2));
+}
+
+#[tokio::test]
+async fn test_files_system_table() {
+    let (ctx, catalog, _tmp) = create_context().await;
+    let sql = format!("SELECT * FROM paimon.default.{FIXTURE_TABLE}$files");
+    let batches = run_sql(&ctx, &sql).await;
+
+    assert!(
+        !batches.is_empty(),
+        "$files should return at least one batch"
+    );
+    let arrow_schema = batches[0].schema();
+    let expected_columns = [
+        ("partition", DataType::Utf8),
+        ("bucket", DataType::Int32),
+        ("file_path", DataType::Utf8),
+        ("file_format", DataType::Utf8),
+        ("schema_id", DataType::Int64),
+        ("level", DataType::Int32),
+        ("record_count", DataType::Int64),
+        ("file_size_in_bytes", DataType::Int64),
+        ("min_key", DataType::Utf8),
+        ("max_key", DataType::Utf8),
+        ("null_value_counts", DataType::Utf8),
+        ("min_value_stats", DataType::Utf8),
+        ("max_value_stats", DataType::Utf8),
+        ("min_sequence_number", DataType::Int64),
+        ("max_sequence_number", DataType::Int64),
+        (
+            "creation_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        ),
+        ("deleteRowCount", DataType::Int64),
+        ("file_source", DataType::Utf8),
+        ("first_row_id", DataType::Int64),
+        (
+            "write_cols",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        ),
+    ];
+    for (i, (name, dtype)) in expected_columns.iter().enumerate() {
+        let field = arrow_schema.field(i);
+        assert_eq!(field.name(), name, "column {i} name");
+        assert_eq!(field.data_type(), dtype, "column {i} type");
+    }
+
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let table = catalog.get_table(&identifier).await.unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap();
+    let expected_rows: usize = plan
+        .splits()
+        .iter()
+        .map(|split| split.data_files().len())
+        .sum();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, expected_rows);
+    assert!(total_rows > 0, "fixture should contain data files");
+
+    for batch in &batches {
+        let paths = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("file_path is Utf8");
+        let formats = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("file_format is Utf8");
+        let null_counts = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("null_value_counts is Utf8");
+        for i in 0..batch.num_rows() {
+            assert!(!paths.value(i).is_empty(), "file_path must be non-empty");
+            assert!(
+                !formats.value(i).is_empty(),
+                "file_format must be non-empty"
+            );
+            assert!(
+                null_counts.value(i).starts_with('{') && null_counts.value(i).ends_with('}'),
+                "null_value_counts should be Java-map-like"
+            );
+        }
+    }
 }
 
 fn single_int_partition_stat(value: &str) -> i32 {

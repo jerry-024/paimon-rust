@@ -30,6 +30,7 @@ use paimon::table::Table;
 use crate::error::to_datafusion_error;
 
 mod branches;
+mod files;
 mod manifests;
 mod options;
 mod partitions;
@@ -47,6 +48,7 @@ type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 // metadata via `Catalog::list_partitions`).
 const TABLES: &[(&str, Builder)] = &[
     ("branches", branches::build),
+    ("files", files::build),
     ("manifests", manifests::build),
     ("options", options::build),
     ("physical_files_size", physical_files_size::build),
@@ -58,6 +60,7 @@ const TABLES: &[(&str, Builder)] = &[
 
 const SYSTEM_TABLE_NAMES: &[&str] = &[
     "branches",
+    "files",
     "manifests",
     "options",
     "partitions",
@@ -184,6 +187,9 @@ mod tests {
         assert!(is_registered("branches"));
         assert!(is_registered("Branches"));
         assert!(is_registered("BRANCHES"));
+        assert!(is_registered("files"));
+        assert!(is_registered("Files"));
+        assert!(is_registered("FILES"));
         assert!(is_registered("tags"));
         assert!(is_registered("Tags"));
         assert!(is_registered("TAGS"));

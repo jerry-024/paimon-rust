@@ -47,6 +47,35 @@ pub(super) fn format_row_as_java_cast_string(
     Ok(out)
 }
 
+pub(super) fn format_row_as_java_array_string(
+    row: &BinaryRow,
+    fields: &[DataField],
+) -> Result<String> {
+    validate_row(row, fields)?;
+
+    let mut out = String::from("[");
+    for (pos, field) in fields.iter().enumerate() {
+        if pos > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format_field(row, pos, field.data_type())?);
+    }
+    out.push(']');
+    Ok(out)
+}
+
+pub(super) fn format_row_field_as_java_cast_string(
+    row: &BinaryRow,
+    pos: usize,
+    data_type: &DataType,
+) -> Result<Option<String>> {
+    validate_row_has_field(row, pos)?;
+    if row.is_null_at(pos) {
+        return Ok(None);
+    }
+    format_field(row, pos, data_type).map(Some)
+}
+
 fn validate_row(row: &BinaryRow, fields: &[DataField]) -> Result<()> {
     if row.arity() < 0 {
         return Err(data_invalid(format!(
@@ -60,6 +89,32 @@ fn validate_row(row: &BinaryRow, fields: &[DataField]) -> Result<()> {
         return Err(data_invalid(format!(
             "Row string cast row arity {arity} does not match field count {}",
             fields.len()
+        )));
+    }
+
+    let min_size = BinaryRow::cal_fix_part_size_in_bytes(row.arity()) as usize;
+    if row.data().len() < min_size {
+        return Err(data_invalid(format!(
+            "Row string cast row data too short: need at least {min_size} bytes, got {}",
+            row.data().len()
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_row_has_field(row: &BinaryRow, pos: usize) -> Result<()> {
+    if row.arity() < 0 {
+        return Err(data_invalid(format!(
+            "Row string cast row has negative arity {}",
+            row.arity()
+        )));
+    }
+
+    let arity = row.arity() as usize;
+    if pos >= arity {
+        return Err(data_invalid(format!(
+            "Row string cast field index {pos} is outside row arity {arity}"
         )));
     }
 
