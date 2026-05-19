@@ -177,7 +177,10 @@ async fn test_table_indexes_system_table() {
     let expected_entries =
         paimon::spec::IndexManifest::read(table.file_io(), &sm.manifest_path(index_manifest))
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.kind == paimon::spec::FileKind::Add)
+            .collect::<Vec<_>>();
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(

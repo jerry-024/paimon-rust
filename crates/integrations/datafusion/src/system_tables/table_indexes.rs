@@ -32,7 +32,9 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use paimon::spec::{BinaryRow, DataField, DeletionVectorMeta, IndexManifest, IndexManifestEntry};
+use paimon::spec::{
+    BinaryRow, DataField, DeletionVectorMeta, FileKind, IndexManifest, IndexManifestEntry,
+};
 use paimon::table::{SnapshotManager, Table};
 
 use super::row_string_cast::format_row_as_java_cast_string;
@@ -204,7 +206,15 @@ async fn collect_index_entries(table: &Table) -> paimon::Result<Vec<IndexManifes
         return Ok(Vec::new());
     }
 
-    IndexManifest::read(file_io, &path).await
+    let entries = IndexManifest::read(file_io, &path).await?;
+    Ok(visible_index_entries(entries))
+}
+
+fn visible_index_entries(entries: Vec<IndexManifestEntry>) -> Vec<IndexManifestEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind == FileKind::Add)
+        .collect()
 }
 
 fn format_partition(partition: &[u8], partition_fields: &[DataField]) -> DFResult<String> {
@@ -261,4 +271,41 @@ where
         values.append(true);
     }
     builder.append(true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paimon::spec::IndexFileMeta;
+
+    fn index_entry(kind: FileKind, file_name: &str) -> IndexManifestEntry {
+        IndexManifestEntry {
+            kind,
+            partition: vec![],
+            bucket: 0,
+            index_file: IndexFileMeta {
+                index_type: "DELETION_VECTORS".to_string(),
+                file_name: file_name.to_string(),
+                file_size: 1,
+                row_count: 1,
+                deletion_vectors_ranges: None,
+                global_index_meta: None,
+            },
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn visible_index_entries_skips_delete_entries() {
+        let entries = vec![
+            index_entry(FileKind::Add, "live.idx"),
+            index_entry(FileKind::Delete, "deleted.idx"),
+        ];
+
+        let visible = visible_index_entries(entries);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].kind, FileKind::Add);
+        assert_eq!(visible[0].index_file.file_name, "live.idx");
+    }
 }
