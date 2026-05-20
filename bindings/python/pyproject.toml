@@ -39,6 +39,12 @@ classifiers = [
     "Programming Language :: Rust",
 ]
 
+[project.optional-dependencies]
+video = [
+    "av>=17.0,<18.0",
+    "pillow>=12.0,<13.0",
+]
+
 [tool.maturin]
 module-name = "pypaimon_rust.pypaimon_rust"
 python-source = "python"
@@ -54,4 +60,6 @@ dev = [
     "pytest>=8.0",
     "pyarrow>=17.0,<24.0",
     "datafusion==53.0.0",
+    "av>=17.0,<18.0",
+    "pillow>=12.0,<13.0",
 ]

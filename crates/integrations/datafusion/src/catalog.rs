@@ -34,7 +34,7 @@ use crate::error::to_datafusion_error;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
 use crate::system_tables;
 use crate::table::PaimonTableProvider;
-use crate::DynamicOptions;
+use crate::{BlobReaderRegistry, DynamicOptions};
 
 /// Provides an interface to manage and access multiple schemas (databases)
 /// within a Paimon [`Catalog`].
@@ -54,6 +54,7 @@ pub struct PaimonCatalogProvider {
     /// propagate the panic to all subsequent operations. The worst case is a temp table
     /// becoming invisible or stale, which is recoverable by re-registering it.
     temp_tables: Arc<RwLock<HashMap<String, Arc<MemorySchemaProvider>>>>,
+    blob_reader_registry: BlobReaderRegistry,
 }
 
 impl Debug for PaimonCatalogProvider {
@@ -73,17 +74,20 @@ impl PaimonCatalogProvider {
             catalog,
             dynamic_options: Default::default(),
             temp_tables: Arc::new(RwLock::new(HashMap::new())),
+            blob_reader_registry: BlobReaderRegistry::default(),
         }
     }
 
     pub(crate) fn with_dynamic_options(
         catalog: Arc<dyn Catalog>,
         dynamic_options: DynamicOptions,
+        blob_reader_registry: BlobReaderRegistry,
     ) -> Self {
         PaimonCatalogProvider {
             catalog,
             dynamic_options,
             temp_tables: Arc::new(RwLock::new(HashMap::new())),
+            blob_reader_registry,
         }
     }
 }
@@ -109,6 +113,7 @@ impl CatalogProvider for PaimonCatalogProvider {
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
+        let blob_reader_registry = self.blob_reader_registry.clone();
         let name = name.to_string();
 
         let temp_provider = {
@@ -124,6 +129,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                         name,
                         dynamic_options,
                         temp_provider,
+                        blob_reader_registry,
                     )) as Arc<dyn SchemaProvider>),
                     Err(paimon::Error::DatabaseNotExist { .. }) => {
                         if temp_provider.is_some() {
@@ -132,6 +138,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                                 name,
                                 dynamic_options,
                                 temp_provider,
+                                blob_reader_registry,
                             )) as Arc<dyn SchemaProvider>)
                         } else {
                             None
@@ -154,6 +161,7 @@ impl CatalogProvider for PaimonCatalogProvider {
     ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
+        let blob_reader_registry = self.blob_reader_registry.clone();
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -166,6 +174,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     name,
                     dynamic_options,
                     None,
+                    blob_reader_registry,
                 )) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
@@ -179,6 +188,7 @@ impl CatalogProvider for PaimonCatalogProvider {
     ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
+        let blob_reader_registry = self.blob_reader_registry.clone();
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -191,6 +201,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     name,
                     dynamic_options,
                     None,
+                    blob_reader_registry,
                 )) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
@@ -289,6 +300,7 @@ pub struct PaimonSchemaProvider {
     dynamic_options: DynamicOptions,
     /// Optional temporary in-memory provider for temp tables and views.
     temp_provider: Option<Arc<MemorySchemaProvider>>,
+    blob_reader_registry: BlobReaderRegistry,
 }
 
 impl Debug for PaimonSchemaProvider {
@@ -307,12 +319,14 @@ impl PaimonSchemaProvider {
         database: String,
         dynamic_options: DynamicOptions,
         temp_provider: Option<Arc<MemorySchemaProvider>>,
+        blob_reader_registry: BlobReaderRegistry,
     ) -> Self {
         PaimonSchemaProvider {
             catalog,
             database,
             dynamic_options,
             temp_provider,
+            blob_reader_registry,
         }
     }
 }
@@ -372,6 +386,7 @@ impl SchemaProvider for PaimonSchemaProvider {
 
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
+        let blob_reader_registry = self.blob_reader_registry.clone();
         let identifier = Identifier::new(self.database.clone(), base);
         await_with_runtime(async move {
             match catalog.get_table(&identifier).await {
@@ -382,7 +397,10 @@ impl SchemaProvider for PaimonSchemaProvider {
                     } else {
                         table.copy_with_options(opts)
                     };
-                    let provider = PaimonTableProvider::try_new(table)?;
+                    let provider = PaimonTableProvider::try_new_with_blob_reader_registry(
+                        table,
+                        blob_reader_registry,
+                    )?;
                     Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
                 }
                 Err(paimon::Error::TableNotExist { .. }) => Ok(None),

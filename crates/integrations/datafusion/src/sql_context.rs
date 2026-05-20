@@ -65,7 +65,7 @@ use paimon::spec::{
 };
 
 use crate::error::to_datafusion_error;
-use crate::DynamicOptions;
+use crate::{BlobReaderRegistry, DynamicOptions};
 
 /// A SQL context that supports registering multiple Paimon catalogs and executing SQL.
 ///
@@ -81,6 +81,7 @@ pub struct SQLContext {
     catalogs: HashMap<String, Arc<dyn Catalog>>,
     /// Session-scoped dynamic options set via `SET 'paimon.key' = 'value'`.
     dynamic_options: DynamicOptions,
+    blob_reader_registry: BlobReaderRegistry,
 }
 
 impl Default for SQLContext {
@@ -102,7 +103,12 @@ impl SQLContext {
             ctx,
             catalogs: HashMap::new(),
             dynamic_options: Default::default(),
+            blob_reader_registry: BlobReaderRegistry::default(),
         }
+    }
+
+    pub fn blob_reader_registry(&self) -> BlobReaderRegistry {
+        self.blob_reader_registry.clone()
     }
 
     /// Registers a Paimon catalog under the given name.
@@ -134,6 +140,7 @@ impl SQLContext {
             Arc::new(crate::catalog::PaimonCatalogProvider::with_dynamic_options(
                 catalog.clone(),
                 self.dynamic_options.clone(),
+                self.blob_reader_registry.clone(),
             )),
         );
         register_table_functions(&self.ctx, &catalog, default_db);
@@ -471,7 +478,10 @@ impl SQLContext {
             options.insert(SCAN_VERSION_OPTION.to_string(), info.version.clone());
 
             let table_with_options = paimon_table.copy_with_options(options);
-            let provider = Arc::new(PaimonTableProvider::try_new(table_with_options)?);
+            let provider = Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
+                table_with_options,
+                self.blob_reader_registry.clone(),
+            )?);
 
             let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
             self.register_temp_table(uuid_name.as_str(), provider)?;
@@ -497,7 +507,10 @@ impl SQLContext {
             options.insert(SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), millis.to_string());
 
             let table_with_options = paimon_table.copy_with_options(options);
-            let provider = Arc::new(PaimonTableProvider::try_new(table_with_options)?);
+            let provider = Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
+                table_with_options,
+                self.blob_reader_registry.clone(),
+            )?);
 
             let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
             self.register_temp_table(uuid_name.as_str(), provider)?;

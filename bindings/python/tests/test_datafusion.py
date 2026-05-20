@@ -15,20 +15,269 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import io
 import os
+import struct
+import sys
 import tempfile
+import types
+from pathlib import Path
 
 import pyarrow as pa
+import pytest
 from datafusion import SessionContext
 
 from pypaimon_rust.datafusion import PaimonCatalog, PythonScalarUDF, SQLContext, udf
 
 WAREHOUSE = os.environ.get("PAIMON_TEST_WAREHOUSE", "/tmp/paimon-warehouse")
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+BLOB_DESCRIPTOR_MAGIC = 0x424C4F4244455343
+
+
+def serialize_blob_descriptor(uri: str, offset: int, length: int) -> bytes:
+    uri_bytes = uri.encode("utf-8")
+    return (
+        struct.pack("<BQI", 2, BLOB_DESCRIPTOR_MAGIC, len(uri_bytes))
+        + uri_bytes
+        + struct.pack("<qq", offset, length)
+    )
+
+
+def write_sample_video(
+    path: Path,
+    colors: tuple[tuple[int, int, int], ...] = ((240, 40, 80),),
+) -> None:
+    av = pytest.importorskip("av")
+    image_module = pytest.importorskip("PIL.Image")
+
+    with av.open(str(path), mode="w") as container:
+        stream = container.add_stream("mpeg4", rate=1)
+        stream.width = 32
+        stream.height = 32
+        stream.pix_fmt = "yuv420p"
+
+        for color in colors:
+            image = image_module.new("RGB", (32, 32), color=color)
+            frame = av.VideoFrame.from_image(image)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+
+def sample_image_bytes() -> bytes:
+    image_module = pytest.importorskip("PIL.Image")
+
+    output = io.BytesIO()
+    image = image_module.new("RGB", (32, 32), color=(40, 120, 220))
+    image.save(output, format="PNG")
+    return output.getvalue()
 
 
 def extract_rows(batches):
     table = pa.Table.from_batches(batches)
     return sorted(zip(table["id"].to_pylist(), table["name"].to_pylist()))
+
+
+def test_video_snapshot_builtin_registered_on_context_init():
+    ctx = SQLContext()
+
+    batches = ctx.sql("SELECT video_snapshot(CAST(NULL AS BYTEA)) AS cover_png")
+    table = pa.Table.from_batches(batches)
+
+    assert table["cover_png"].to_pylist() == [None]
+
+
+def test_sql_context_survives_video_snapshot_registration_failure(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "pypaimon_rust.functions",
+        types.SimpleNamespace(),
+    )
+
+    with pytest.warns(
+        RuntimeWarning,
+        match="video_snapshot built-in could not be registered",
+    ):
+        ctx = SQLContext()
+
+    batches = ctx.sql("SELECT 1 AS value")
+    table = pa.Table.from_batches(batches)
+    assert table["value"].to_pylist() == [1]
+
+
+def test_video_snapshot_builtin_auto_registered_for_sql():
+    with tempfile.TemporaryDirectory() as warehouse:
+        video_path = Path(warehouse) / "sample.mp4"
+        write_sample_video(video_path)
+        video_bytes = video_path.read_bytes()
+
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.register_batch(
+            "paimon.default.videos",
+            pa.record_batch(
+                [[1], pa.array([video_bytes], type=pa.binary())],
+                names=["id", "video"],
+            ),
+        )
+
+        batches = ctx.sql(
+            """
+            SELECT id, video_snapshot(video) AS cover_png
+            FROM paimon.default.videos
+            """
+        )
+        table = pa.Table.from_batches(batches)
+
+        assert table["id"].to_pylist() == [1]
+        assert table["cover_png"].to_pylist()[0].startswith(PNG_SIGNATURE)
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.videos")
+
+
+def test_video_snapshot_descriptor_without_table_file_io_returns_null():
+    with tempfile.TemporaryDirectory() as warehouse:
+        video_path = Path(warehouse) / "sample.mp4"
+        write_sample_video(video_path)
+        descriptor = serialize_blob_descriptor(
+            str(video_path), 0, video_path.stat().st_size
+        )
+
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.register_batch(
+            "paimon.default.videos",
+            pa.record_batch(
+                [[1], pa.array([descriptor], type=pa.binary())],
+                names=["id", "video"],
+            ),
+        )
+
+        batches = ctx.sql(
+            """
+            SELECT id, video_snapshot(video) AS cover_png
+            FROM paimon.default.videos
+            """
+        )
+        table = pa.Table.from_batches(batches)
+
+        assert table["id"].to_pylist() == [1]
+        assert table["cover_png"].to_pylist() == [None]
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.videos")
+
+
+def test_video_snapshot_returns_null_for_image_bytes():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.register_batch(
+            "paimon.default.media",
+            pa.record_batch(
+                [[1], pa.array([sample_image_bytes()], type=pa.binary())],
+                names=["id", "content"],
+            ),
+        )
+
+        batches = ctx.sql(
+            """
+            SELECT id, video_snapshot(content) AS cover_png
+            FROM paimon.default.media
+            """
+        )
+        table = pa.Table.from_batches(batches)
+
+        assert table["id"].to_pylist() == [1]
+        assert table["cover_png"].to_pylist() == [None]
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.media")
+
+
+def test_video_snapshot_reads_descriptor_with_table_file_io():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE TABLE paimon.default.videos (id INT, video BINARY)")
+
+        video_path = Path(warehouse) / "default.db" / "videos" / "sample.mp4"
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        write_sample_video(video_path)
+        descriptor = serialize_blob_descriptor(
+            str(video_path), 0, video_path.stat().st_size
+        )
+
+        ctx.register_batch(
+            "source_videos",
+            pa.record_batch(
+                [[1], pa.array([descriptor], type=pa.binary())],
+                names=["id", "video"],
+            ),
+        )
+        ctx.sql(
+            """
+            INSERT INTO paimon.default.videos
+            SELECT id, video FROM paimon.default.source_videos
+            """
+        )
+
+        batches = ctx.sql(
+            """
+            SELECT id, video_snapshot(video) AS cover_png
+            FROM paimon.default.videos
+            """
+        )
+        table = pa.Table.from_batches(batches)
+
+        assert table["id"].to_pylist() == [1]
+        assert table["cover_png"].to_pylist()[0].startswith(PNG_SIGNATURE)
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.source_videos")
+        ctx.sql("DROP TABLE paimon.default.videos")
+
+
+def test_video_snapshot_accepts_timestamp_ms():
+    image_module = pytest.importorskip("PIL.Image")
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        video_path = Path(warehouse) / "sample.mp4"
+        write_sample_video(video_path, colors=((240, 40, 80), (40, 220, 80)))
+        video_bytes = video_path.read_bytes()
+
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.register_batch(
+            "paimon.default.videos",
+            pa.record_batch(
+                [[1], pa.array([video_bytes], type=pa.binary())],
+                names=["id", "video"],
+            ),
+        )
+
+        batches = ctx.sql(
+            """
+            SELECT
+                video_snapshot(video) AS first_png,
+                video_snapshot(video, CAST(1000 AS INT)) AS second_png,
+                video_snapshot(video, 5000) AS beyond_duration_png
+            FROM paimon.default.videos
+            """
+        )
+        row = pa.Table.from_batches(batches).to_pylist()[0]
+
+        assert row["first_png"].startswith(PNG_SIGNATURE)
+        assert row["second_png"].startswith(PNG_SIGNATURE)
+
+        first_image = image_module.open(io.BytesIO(row["first_png"])).convert("RGB")
+        second_image = image_module.open(io.BytesIO(row["second_png"])).convert("RGB")
+        assert first_image.getpixel((16, 16)) != second_image.getpixel((16, 16))
+        assert row["beyond_duration_png"].startswith(PNG_SIGNATURE)
+        beyond_duration_image = image_module.open(
+            io.BytesIO(row["beyond_duration_png"])
+        ).convert("RGB")
+        assert beyond_duration_image.getpixel((16, 16)) == second_image.getpixel((16, 16))
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.videos")
 
 
 def test_query_simple_table_via_catalog_provider():
@@ -125,7 +374,82 @@ def test_register_udf_from_python():
         ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
 
 
-def test_register_udf_multi_input_plan():
+def test_register_udf_default_name_is_sql_identifier_for_closure():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+
+        batch = pa.record_batch([[1, 2]], names=["id"])
+        ctx.register_batch("my_temp", batch)
+
+        def build_udf():
+            def plus_one(values):
+                return pa.array(
+                    [value + 1 for value in values.to_pylist()], type=pa.int64()
+                )
+
+            return plus_one
+
+        scalar_udf = udf(build_udf(), [pa.int64()], pa.int64(), "volatile")
+        assert scalar_udf.name == "plus_one"
+        ctx.register_udf(scalar_udf)
+
+        batches = ctx.sql(
+            "SELECT plus_one(id) AS id FROM paimon.default.my_temp ORDER BY id"
+        )
+        table = pa.Table.from_batches(batches)
+        assert table["id"].to_pylist() == [2, 3]
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
+
+
+def test_register_udf_multiple_arguments():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+
+        batch = pa.record_batch(
+            [
+                pa.array([1, 2, None], type=pa.int64()),
+                pa.array([10, 20, 30], type=pa.int64()),
+            ],
+            names=["id", "delta"],
+        )
+        ctx.register_batch("my_temp", batch)
+
+        def add_values(left, right):
+            values = []
+            for left_value, right_value in zip(left.to_pylist(), right.to_pylist()):
+                if left_value is None or right_value is None:
+                    values.append(None)
+                else:
+                    values.append(left_value + right_value)
+            return pa.array(values, type=pa.int64())
+
+        ctx.register_udf(
+            udf(
+                add_values,
+                [pa.int64(), pa.int64()],
+                pa.int64(),
+                "volatile",
+                "add_values",
+            )
+        )
+
+        batches = ctx.sql(
+            """
+            SELECT add_values(id, delta) AS value
+            FROM paimon.default.my_temp
+            ORDER BY id
+            """
+        )
+        table = pa.Table.from_batches(batches)
+        assert table["value"].to_pylist() == [11, 22, None]
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
+
+
+def test_register_udf_multi_partition_union_plan():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
@@ -155,7 +479,7 @@ def test_register_udf_multi_input_plan():
 def test_udf_rejects_non_callable():
     try:
         udf(1, [pa.int64()], pa.int64(), "volatile")
-        assert False, "expected non-callable UDF creation to fail"
+        pytest.fail("expected non-callable UDF creation to fail")
     except TypeError as e:
         assert "`func` argument must be callable" in str(e)
 
@@ -166,7 +490,7 @@ def test_udf_rejects_unsupported_type():
 
     try:
         udf(identity, [object()], pa.int64(), "volatile", "identity")
-        assert False, "expected unsupported type registration to fail"
+        pytest.fail("expected unsupported type registration to fail")
     except TypeError as e:
         assert "Expected a pyarrow.DataType" in str(e)
 
@@ -196,7 +520,7 @@ def test_python_udf_exception_surfaces():
 
         try:
             ctx.sql("SELECT boom(id) AS id FROM paimon.default.my_temp")
-            assert False, "expected Python UDF exception to fail the query"
+            pytest.fail("expected Python UDF exception to fail the query")
         except Exception as e:
             message = str(e)
             assert "Python UDF 'boom' failed" in message
@@ -218,7 +542,7 @@ def test_python_udf_rejects_wrong_length():
 
         try:
             ctx.sql("SELECT wrong_length(id) AS id FROM paimon.default.my_temp")
-            assert False, "expected wrong-length UDF result to fail the query"
+            pytest.fail("expected wrong-length UDF result to fail the query")
         except Exception as e:
             message = str(e)
             assert "Python UDF 'wrong_length' returned 1 rows, expected 2" in message
@@ -239,7 +563,7 @@ def test_python_udf_rejects_wrong_type():
 
         try:
             ctx.sql("SELECT wrong_type(id) AS id FROM paimon.default.my_temp")
-            assert False, "expected wrong-type UDF result to fail the query"
+            pytest.fail("expected wrong-type UDF result to fail the query")
         except Exception as e:
             message = str(e)
             assert "Python UDF 'wrong_type' returned Utf8, expected Int64" in message
@@ -319,7 +643,7 @@ def test_register_batch_invalid_catalog():
         batch = pa.record_batch([[1]], names=["id"])
         try:
             ctx.register_batch("unknown_catalog.default.my_temp", batch)
-            assert False, "Expected an error for unknown catalog"
+            pytest.fail("Expected an error for unknown catalog")
         except Exception as e:
             assert "unknown_catalog" in str(e).lower() or "not a paimon" in str(e).lower() or "unknown" in str(e).lower()
 
@@ -336,6 +660,6 @@ def test_table_functions_registered_with_catalog():
         for fn in ("vector_search", "full_text_search"):
             try:
                 ctx.sql(f"SELECT * FROM {fn}('only_one_arg')")
-                assert False, f"expected {fn} to reject a single argument"
+                pytest.fail(f"expected {fn} to reject a single argument")
             except Exception as e:
                 assert "requires 4 arguments" in str(e), str(e)

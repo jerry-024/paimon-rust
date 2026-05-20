@@ -17,8 +17,10 @@
 
 use pyo3::prelude::*;
 
+mod blob;
 mod context;
 mod error;
+mod udf;
 
 #[pymodule]
 fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {

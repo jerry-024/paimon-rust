@@ -32,6 +32,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use paimon::table::Table;
 
 use crate::physical_plan::PaimonDataSink;
+use crate::BlobReaderRegistry;
 
 use crate::error::to_datafusion_error;
 #[cfg(test)]
@@ -72,6 +73,15 @@ impl PaimonTableProvider {
         let schema =
             paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
         Ok(Self { table, schema })
+    }
+
+    pub fn try_new_with_blob_reader_registry(
+        table: Table,
+        blob_reader_registry: BlobReaderRegistry,
+    ) -> DFResult<Self> {
+        blob_reader_registry
+            .register_if_absent(table.location().to_string(), table.file_io().clone());
+        Self::try_new(table)
     }
 
     pub fn table(&self) -> &Table {

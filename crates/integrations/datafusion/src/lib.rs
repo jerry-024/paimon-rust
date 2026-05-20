@@ -36,6 +36,7 @@
 //! This version supports partition predicate pushdown by extracting
 //! translatable partition-only conjuncts from DataFusion filters.
 
+mod blob_reader;
 mod catalog;
 mod delete;
 mod error;
@@ -63,6 +64,7 @@ use std::sync::{Arc, RwLock};
 /// so that SET/RESET mutations are visible to subsequent table scans.
 pub(crate) type DynamicOptions = Arc<RwLock<HashMap<String, String>>>;
 
+pub use blob_reader::BlobReaderRegistry;
 pub use catalog::{PaimonCatalogProvider, PaimonSchemaProvider};
 pub use error::to_datafusion_error;
 #[cfg(feature = "fulltext")]
