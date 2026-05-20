@@ -16,4 +16,3 @@
 # under the License.
 
 from .pypaimon_rust import *
-from .functions import register_python_udf
