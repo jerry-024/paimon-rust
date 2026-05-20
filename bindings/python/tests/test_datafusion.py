@@ -21,7 +21,7 @@ import tempfile
 import pyarrow as pa
 from datafusion import SessionContext
 
-from pypaimon_rust.datafusion import PaimonCatalog, SQLContext, ScalarUDF, udf
+from pypaimon_rust.datafusion import PaimonCatalog, PythonScalarUDF, SQLContext, udf
 
 WAREHOUSE = os.environ.get("PAIMON_TEST_WAREHOUSE", "/tmp/paimon-warehouse")
 
@@ -171,16 +171,16 @@ def test_udf_rejects_unsupported_type():
         assert "Expected a pyarrow.DataType" in str(e)
 
 
-def test_scalar_udf_constructor_matches_datafusion_shape():
+def test_python_scalar_udf_constructor_matches_datafusion_shape():
     def identity(values):
         return values
 
-    scalar_udf = ScalarUDF(
+    scalar_udf = PythonScalarUDF(
         "identity", identity, [pa.field("value", pa.int64())], pa.int64(), "stable"
     )
 
     assert scalar_udf.name == "identity"
-    assert repr(scalar_udf) == "ScalarUDF(identity)"
+    assert repr(scalar_udf) == "PythonScalarUDF(identity)"
 
 
 def test_python_udf_exception_surfaces():

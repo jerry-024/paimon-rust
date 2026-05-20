@@ -191,13 +191,13 @@ impl PyScalarUDF {
     }
 }
 
-#[pyclass(name = "ScalarUDF")]
-pub struct PyScalarUDFObject {
+#[pyclass(name = "PythonScalarUDF")]
+pub struct PyPythonScalarUDFObject {
     name: String,
     udf: DFScalarUDF,
 }
 
-impl PyScalarUDFObject {
+impl PyPythonScalarUDFObject {
     fn create(
         py: Python<'_>,
         name: String,
@@ -222,7 +222,7 @@ impl PyScalarUDFObject {
 }
 
 #[pymethods]
-impl PyScalarUDFObject {
+impl PyPythonScalarUDFObject {
     #[new]
     fn new(
         py: Python<'_>,
@@ -258,7 +258,7 @@ impl PyScalarUDFObject {
     }
 
     fn __repr__(&self) -> String {
-        format!("ScalarUDF({})", self.name)
+        format!("PythonScalarUDF({})", self.name)
     }
 }
 
@@ -271,8 +271,8 @@ fn udf(
     return_field: Bound<'_, PyAny>,
     volatility: Bound<'_, PyAny>,
     name: Option<String>,
-) -> PyResult<PyScalarUDFObject> {
-    PyScalarUDFObject::udf(py, func, input_fields, return_field, volatility, name)
+) -> PyResult<PyPythonScalarUDFObject> {
+    PyPythonScalarUDFObject::udf(py, func, input_fields, return_field, volatility, name)
 }
 
 impl Debug for PyScalarUDF {
@@ -454,7 +454,7 @@ impl PySQLContext {
             .map_err(df_to_py_err)
     }
 
-    fn register_udf(&self, udf: &PyScalarUDFObject) -> PyResult<()> {
+    fn register_udf(&self, udf: &PyPythonScalarUDFObject) -> PyResult<()> {
         self.inner.ctx().register_udf(udf.udf.clone());
         Ok(())
     }
@@ -477,7 +477,7 @@ impl PySQLContext {
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "datafusion")?;
     this.add_class::<PaimonCatalog>()?;
-    this.add_class::<PyScalarUDFObject>()?;
+    this.add_class::<PyPythonScalarUDFObject>()?;
     this.add_class::<PySQLContext>()?;
     this.add_function(wrap_pyfunction!(udf, &this)?)?;
     m.add_submodule(&this)?;
