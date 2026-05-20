@@ -15,5 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from .pypaimon_rust import *
-from .functions import register_python_udf
+from typing import Callable, Optional
+
+import pyarrow
+
+from pypaimon_rust.datafusion import (
+    ArrowTypeLike,
+    InputFieldsLike,
+    PythonScalarUDF,
+    VolatilityLike,
+)
+
+def register_python_udf(
+    ctx,
+    func: Callable[..., pyarrow.Array],
+    input_fields: InputFieldsLike,
+    return_field: ArrowTypeLike,
+    volatility: VolatilityLike = "volatile",
+    name: Optional[str] = None,
+) -> PythonScalarUDF: ...

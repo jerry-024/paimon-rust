@@ -15,5 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from .pypaimon_rust import *
-from .functions import register_python_udf
+from typing import Optional
+
+from pypaimon_rust.datafusion import PythonScalarUDF, udf
+
+
+def register_python_udf(
+    ctx,
+    func,
+    input_fields,
+    return_field,
+    volatility="volatile",
+    name: Optional[str] = None,
+) -> PythonScalarUDF:
+    scalar_udf = udf(func, input_fields, return_field, volatility, name)
+    ctx.register_udf(scalar_udf)
+    return scalar_udf

@@ -21,6 +21,7 @@ import tempfile
 import pyarrow as pa
 from datafusion import SessionContext
 
+from pypaimon_rust.functions import register_python_udf
 from pypaimon_rust.datafusion import PaimonCatalog, PythonScalarUDF, SQLContext, udf
 
 WAREHOUSE = os.environ.get("PAIMON_TEST_WAREHOUSE", "/tmp/paimon-warehouse")
@@ -121,6 +122,31 @@ def test_register_udf_from_python():
         )
         table = pa.Table.from_batches(batches)
         assert table["id"].to_pylist() == [11, 13, None]
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
+
+
+def test_register_python_udf_builtin_helper():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.register_batch("my_temp", pa.record_batch([[1, 2]], names=["id"]))
+
+        def plus_one(values):
+            return pa.array([value + 1 for value in values.to_pylist()], type=pa.int64())
+
+        scalar_udf = register_python_udf(
+            ctx,
+            plus_one,
+            [pa.int64()],
+            pa.int64(),
+            name="plus_one",
+        )
+
+        batches = ctx.sql("SELECT plus_one(id) AS id FROM paimon.default.my_temp")
+        table = pa.Table.from_batches(batches)
+        assert isinstance(scalar_udf, PythonScalarUDF)
+        assert table["id"].to_pylist() == [2, 3]
 
         ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
 
