@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 import pyarrow
 
@@ -31,4 +31,11 @@ class SQLContext:
     def set_current_catalog(self, catalog_name: str) -> None: ...
     def set_current_database(self, database_name: str) -> None: ...
     def register_batch(self, name: str, batch: pyarrow.RecordBatch) -> None: ...
+    def register_scalar_function(
+        self,
+        name: str,
+        func: Callable[..., pyarrow.Array],
+        input_types: List[str],
+        return_type: str,
+    ) -> None: ...
     def sql(self, sql: str) -> List[pyarrow.RecordBatch]: ...

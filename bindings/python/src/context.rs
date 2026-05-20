@@ -15,17 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::{self, Debug};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use arrow::array::{make_array, Array, ArrayData, ArrayRef};
+use arrow::datatypes::DataType as ArrowDataType;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use datafusion::catalog::CatalogProvider;
+use datafusion::common::{DataFusionError, Result as DFResult};
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use paimon::{CatalogFactory, Options};
 use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::PyCapsule;
+use pyo3::types::{PyCapsule, PyTuple};
 
 use crate::error::{df_to_py_err, to_py_err};
 use paimon_datafusion::runtime::runtime;
@@ -55,6 +65,147 @@ fn ffi_logical_codec_from_pycapsule(obj: Bound<'_, PyAny>) -> PyResult<FFI_Logic
     let codec = unsafe { ptr.cast::<FFI_LogicalExtensionCodec>().as_ref() };
 
     Ok(codec.clone())
+}
+
+fn parse_arrow_type(type_name: &str) -> PyResult<ArrowDataType> {
+    match type_name.to_ascii_lowercase().as_str() {
+        "bool" | "boolean" => Ok(ArrowDataType::Boolean),
+        "int8" => Ok(ArrowDataType::Int8),
+        "int16" => Ok(ArrowDataType::Int16),
+        "int" | "int32" | "integer" => Ok(ArrowDataType::Int32),
+        "bigint" | "int64" | "long" => Ok(ArrowDataType::Int64),
+        "float" | "float32" => Ok(ArrowDataType::Float32),
+        "double" | "float64" => Ok(ArrowDataType::Float64),
+        "string" | "utf8" => Ok(ArrowDataType::Utf8),
+        "large_string" | "large_utf8" => Ok(ArrowDataType::LargeUtf8),
+        "binary" => Ok(ArrowDataType::Binary),
+        "large_binary" => Ok(ArrowDataType::LargeBinary),
+        other => Err(PyTypeError::new_err(format!(
+            "Unsupported Arrow type for Python UDF: {other}"
+        ))),
+    }
+}
+
+fn df_execution_error(message: impl Into<String>) -> DataFusionError {
+    DataFusionError::Execution(message.into())
+}
+
+fn columnar_value_to_array(value: &ColumnarValue, num_rows: usize) -> DFResult<ArrayRef> {
+    match value {
+        ColumnarValue::Array(array) => Ok(Arc::clone(array)),
+        ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(num_rows),
+    }
+}
+
+struct PyScalarUDF {
+    name: String,
+    func: Py<PyAny>,
+    input_types: Vec<ArrowDataType>,
+    return_type: ArrowDataType,
+    signature: Signature,
+}
+
+impl PyScalarUDF {
+    fn new(
+        name: String,
+        func: Py<PyAny>,
+        input_types: Vec<ArrowDataType>,
+        return_type: ArrowDataType,
+    ) -> Self {
+        let signature = Signature::exact(input_types.clone(), Volatility::Volatile);
+        Self {
+            name,
+            func,
+            input_types,
+            return_type,
+            signature,
+        }
+    }
+}
+
+impl Debug for PyScalarUDF {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PyScalarUDF")
+            .field("name", &self.name)
+            .field("input_types", &self.input_types)
+            .field("return_type", &self.return_type)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PyScalarUDF {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.input_types == other.input_types
+            && self.return_type == other.return_type
+    }
+}
+
+impl Eq for PyScalarUDF {}
+
+impl Hash for PyScalarUDF {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.input_types.hash(state);
+        self.return_type.hash(state);
+    }
+}
+
+impl ScalarUDFImpl for PyScalarUDF {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> DFResult<ArrowDataType> {
+        Ok(self.return_type.clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let arrays = args
+            .args
+            .iter()
+            .map(|value| columnar_value_to_array(value, args.number_rows))
+            .collect::<DFResult<Vec<_>>>()?;
+
+        let output = Python::try_attach(|py| -> PyResult<ArrayRef> {
+            let py_args = arrays
+                .iter()
+                .map(|array| array.to_data().to_pyarrow(py))
+                .collect::<PyResult<Vec<_>>>()?;
+            let py_args = PyTuple::new(py, py_args)?;
+            let output = self.func.bind(py).call1(py_args)?;
+            Ok(make_array(ArrayData::from_pyarrow_bound(&output)?))
+        })
+        .ok_or_else(|| df_execution_error("Python interpreter is not available"))?
+        .map_err(|err| df_execution_error(format!("Python UDF '{}' failed: {err}", self.name)))?;
+
+        if output.len() != args.number_rows {
+            return Err(df_execution_error(format!(
+                "Python UDF '{}' returned {} rows, expected {}",
+                self.name,
+                output.len(),
+                args.number_rows
+            )));
+        }
+        if output.data_type() != &self.return_type {
+            return Err(df_execution_error(format!(
+                "Python UDF '{}' returned {:?}, expected {:?}",
+                self.name,
+                output.data_type(),
+                self.return_type
+            )));
+        }
+
+        Ok(ColumnarValue::Array(output))
+    }
 }
 
 /// A Paimon catalog exportable to Python DataFusion `SessionContext`.
@@ -146,6 +297,28 @@ impl PySQLContext {
         self.inner
             .register_temp_table(&name, Arc::new(mem_table))
             .map_err(df_to_py_err)
+    }
+
+    fn register_scalar_function(
+        &self,
+        py: Python<'_>,
+        name: String,
+        func: Py<PyAny>,
+        input_types: Vec<String>,
+        return_type: String,
+    ) -> PyResult<()> {
+        if !func.bind(py).is_callable() {
+            return Err(PyTypeError::new_err("func must be callable"));
+        }
+
+        let input_types = input_types
+            .iter()
+            .map(|type_name| parse_arrow_type(type_name))
+            .collect::<PyResult<Vec<_>>>()?;
+        let return_type = parse_arrow_type(&return_type)?;
+        let udf = PyScalarUDF::new(name, func, input_types, return_type);
+        self.inner.ctx().register_udf(ScalarUDF::new_from_impl(udf));
+        Ok(())
     }
 
     fn sql(&self, py: Python<'_>, sql: String) -> PyResult<Vec<Py<PyAny>>> {

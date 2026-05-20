@@ -100,6 +100,29 @@ def test_register_batch_bare_name():
         ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
 
 
+def test_register_scalar_function_from_python():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+
+        batch = pa.record_batch([[1, 2, 3]], names=["id"])
+        ctx.register_batch("my_temp", batch)
+
+        def plus_ten(values):
+            return pa.array(
+                [None if value is None else value + 10 for value in values.to_pylist()],
+                type=pa.int64(),
+            )
+
+        ctx.register_scalar_function("plus_ten", plus_ten, ["int64"], "int64")
+
+        batches = ctx.sql("SELECT plus_ten(id) AS id FROM paimon.default.my_temp ORDER BY id")
+        table = pa.Table.from_batches(batches)
+        assert table["id"].to_pylist() == [11, 12, 13]
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
+
+
 def test_temp_table_shadows_paimon_table():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
