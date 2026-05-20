@@ -21,7 +21,7 @@ import tempfile
 import pyarrow as pa
 from datafusion import SessionContext
 
-from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
+from pypaimon_rust.datafusion import PaimonCatalog, SQLContext, ScalarUDF, udf
 
 WAREHOUSE = os.environ.get("PAIMON_TEST_WAREHOUSE", "/tmp/paimon-warehouse")
 
@@ -100,7 +100,7 @@ def test_register_batch_bare_name():
         ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
 
 
-def test_register_scalar_function_from_python():
+def test_register_udf_from_python():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
@@ -114,7 +114,7 @@ def test_register_scalar_function_from_python():
                 type=pa.int64(),
             )
 
-        ctx.register_scalar_function("plus_ten", plus_ten, ["int64"], "int64")
+        ctx.register_udf(udf(plus_ten, [pa.int64()], pa.int64(), "volatile", "plus_ten"))
 
         batches = ctx.sql(
             "SELECT plus_ten(id) AS id FROM paimon.default.my_temp ORDER BY id"
@@ -125,7 +125,7 @@ def test_register_scalar_function_from_python():
         ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
 
 
-def test_register_scalar_function_multi_input_plan():
+def test_register_udf_multi_input_plan():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
@@ -136,7 +136,7 @@ def test_register_scalar_function_multi_input_plan():
         def plus_ten(values):
             return pa.array([value + 10 for value in values.to_pylist()], type=pa.int64())
 
-        ctx.register_scalar_function("plus_ten", plus_ten, ["int64"], "int64")
+        ctx.register_udf(udf(plus_ten, [pa.int64()], pa.int64(), "volatile", "plus_ten"))
 
         batches = ctx.sql(
             """
@@ -152,29 +152,38 @@ def test_register_scalar_function_multi_input_plan():
         ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
 
 
-def test_register_scalar_function_rejects_non_callable():
-    ctx = SQLContext()
+def test_udf_rejects_non_callable():
     try:
-        ctx.register_scalar_function("bad", 1, ["int64"], "int64")
-        assert False, "expected non-callable UDF registration to fail"
+        udf(1, [pa.int64()], pa.int64(), "volatile")
+        assert False, "expected non-callable UDF creation to fail"
     except TypeError as e:
-        assert "func must be callable" in str(e)
+        assert "`func` argument must be callable" in str(e)
 
 
-def test_register_scalar_function_rejects_unsupported_type():
-    ctx = SQLContext()
-
+def test_udf_rejects_unsupported_type():
     def identity(values):
         return values
 
     try:
-        ctx.register_scalar_function("identity", identity, ["date32"], "date32")
+        udf(identity, [object()], pa.int64(), "volatile", "identity")
         assert False, "expected unsupported type registration to fail"
     except TypeError as e:
-        assert "Unsupported Arrow type" in str(e)
+        assert "Expected a pyarrow.DataType" in str(e)
 
 
-def test_python_scalar_function_exception_surfaces():
+def test_scalar_udf_constructor_matches_datafusion_shape():
+    def identity(values):
+        return values
+
+    scalar_udf = ScalarUDF(
+        "identity", identity, [pa.field("value", pa.int64())], pa.int64(), "stable"
+    )
+
+    assert scalar_udf.name == "identity"
+    assert repr(scalar_udf) == "ScalarUDF(identity)"
+
+
+def test_python_udf_exception_surfaces():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
@@ -183,7 +192,7 @@ def test_python_scalar_function_exception_surfaces():
         def boom(values):
             raise RuntimeError("boom")
 
-        ctx.register_scalar_function("boom", boom, ["int64"], "int64")
+        ctx.register_udf(udf(boom, [pa.int64()], pa.int64(), "volatile", "boom"))
 
         try:
             ctx.sql("SELECT boom(id) AS id FROM paimon.default.my_temp")
@@ -194,7 +203,7 @@ def test_python_scalar_function_exception_surfaces():
             assert "boom" in message
 
 
-def test_python_scalar_function_rejects_wrong_length():
+def test_python_udf_rejects_wrong_length():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
@@ -203,7 +212,9 @@ def test_python_scalar_function_rejects_wrong_length():
         def wrong_length(values):
             return pa.array([1], type=pa.int64())
 
-        ctx.register_scalar_function("wrong_length", wrong_length, ["int64"], "int64")
+        ctx.register_udf(
+            udf(wrong_length, [pa.int64()], pa.int64(), "volatile", "wrong_length")
+        )
 
         try:
             ctx.sql("SELECT wrong_length(id) AS id FROM paimon.default.my_temp")
@@ -213,7 +224,7 @@ def test_python_scalar_function_rejects_wrong_length():
             assert "Python UDF 'wrong_length' returned 1 rows, expected 2" in message
 
 
-def test_python_scalar_function_rejects_wrong_type():
+def test_python_udf_rejects_wrong_type():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
@@ -222,7 +233,9 @@ def test_python_scalar_function_rejects_wrong_type():
         def wrong_type(values):
             return pa.array(["not an int"], type=pa.string())
 
-        ctx.register_scalar_function("wrong_type", wrong_type, ["int64"], "int64")
+        ctx.register_udf(
+            udf(wrong_type, [pa.int64()], pa.int64(), "volatile", "wrong_type")
+        )
 
         try:
             ctx.sql("SELECT wrong_type(id) AS id FROM paimon.default.my_temp")

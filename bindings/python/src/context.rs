@@ -22,12 +22,13 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{make_array, Array, ArrayData, ArrayRef};
-use arrow::datatypes::DataType as ArrowDataType;
+use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use datafusion::catalog::CatalogProvider;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF as DFScalarUDF, ScalarUDFImpl, Signature,
+    Volatility,
 };
 use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
@@ -35,7 +36,7 @@ use paimon::{CatalogFactory, Options};
 use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyCapsule, PyTuple};
+use pyo3::types::{PyCapsule, PyList, PyTuple};
 
 use crate::error::{df_to_py_err, to_py_err};
 use paimon_datafusion::runtime::runtime;
@@ -86,6 +87,70 @@ fn parse_arrow_type(type_name: &str) -> PyResult<ArrowDataType> {
     }
 }
 
+fn parse_arrow_type_like(value: &Bound<'_, PyAny>) -> PyResult<ArrowDataType> {
+    if let Ok(field) = ArrowField::from_pyarrow_bound(value) {
+        return Ok(field.data_type().clone());
+    }
+    if let Ok(data_type) = ArrowDataType::from_pyarrow_bound(value) {
+        return Ok(data_type);
+    }
+    if let Ok(type_name) = value.extract::<String>() {
+        return parse_arrow_type(&type_name);
+    }
+
+    Err(PyTypeError::new_err(
+        "Expected a pyarrow.DataType, pyarrow.Field, or supported Arrow type name",
+    ))
+}
+
+fn parse_input_types(input_fields: &Bound<'_, PyAny>) -> PyResult<Vec<ArrowDataType>> {
+    if let Ok(fields) = input_fields.cast::<PyList>() {
+        return fields
+            .iter()
+            .map(|field| parse_arrow_type_like(&field))
+            .collect();
+    }
+    if let Ok(fields) = input_fields.cast::<PyTuple>() {
+        return fields
+            .iter()
+            .map(|field| parse_arrow_type_like(&field))
+            .collect();
+    }
+
+    Ok(vec![parse_arrow_type_like(input_fields)?])
+}
+
+fn parse_volatility(volatility: &Bound<'_, PyAny>) -> PyResult<Volatility> {
+    let value = if let Ok(value) = volatility.extract::<String>() {
+        value
+    } else if let Ok(name) = volatility.getattr("name") {
+        name.extract::<String>()?
+    } else {
+        volatility.str()?.to_str()?.to_string()
+    };
+
+    match value.to_ascii_lowercase().as_str() {
+        "immutable" => Ok(Volatility::Immutable),
+        "stable" => Ok(Volatility::Stable),
+        "volatile" => Ok(Volatility::Volatile),
+        other => Err(PyTypeError::new_err(format!(
+            "Unsupported UDF volatility: {other}. Expected immutable, stable, or volatile"
+        ))),
+    }
+}
+
+fn default_udf_name(py: Python<'_>, func: &Py<PyAny>) -> PyResult<String> {
+    let func = func.bind(py);
+    if let Ok(name) = func.getattr("__qualname__") {
+        return Ok(name.extract::<String>()?.to_ascii_lowercase());
+    }
+    Ok(func
+        .getattr("__class__")?
+        .getattr("__name__")?
+        .extract::<String>()?
+        .to_ascii_lowercase())
+}
+
 fn df_execution_error(message: impl Into<String>) -> DataFusionError {
     DataFusionError::Execution(message.into())
 }
@@ -102,6 +167,7 @@ struct PyScalarUDF {
     func: Py<PyAny>,
     input_types: Vec<ArrowDataType>,
     return_type: ArrowDataType,
+    volatility: Volatility,
     signature: Signature,
 }
 
@@ -111,16 +177,102 @@ impl PyScalarUDF {
         func: Py<PyAny>,
         input_types: Vec<ArrowDataType>,
         return_type: ArrowDataType,
+        volatility: Volatility,
     ) -> Self {
-        let signature = Signature::exact(input_types.clone(), Volatility::Volatile);
+        let signature = Signature::exact(input_types.clone(), volatility);
         Self {
             name,
             func,
             input_types,
             return_type,
+            volatility,
             signature,
         }
     }
+}
+
+#[pyclass(name = "ScalarUDF")]
+pub struct PyScalarUDFObject {
+    name: String,
+    udf: DFScalarUDF,
+}
+
+impl PyScalarUDFObject {
+    fn create(
+        py: Python<'_>,
+        name: String,
+        func: Py<PyAny>,
+        input_fields: &Bound<'_, PyAny>,
+        return_field: &Bound<'_, PyAny>,
+        volatility: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        if !func.bind(py).is_callable() {
+            return Err(PyTypeError::new_err("`func` argument must be callable"));
+        }
+
+        let input_types = parse_input_types(input_fields)?;
+        let return_type = parse_arrow_type_like(return_field)?;
+        let volatility = parse_volatility(volatility)?;
+        let udf = PyScalarUDF::new(name.clone(), func, input_types, return_type, volatility);
+        Ok(Self {
+            name,
+            udf: DFScalarUDF::new_from_impl(udf),
+        })
+    }
+}
+
+#[pymethods]
+impl PyScalarUDFObject {
+    #[new]
+    fn new(
+        py: Python<'_>,
+        name: String,
+        func: Py<PyAny>,
+        input_fields: Bound<'_, PyAny>,
+        return_field: Bound<'_, PyAny>,
+        volatility: Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        Self::create(py, name, func, &input_fields, &return_field, &volatility)
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (func, input_fields, return_field, volatility, name = None))]
+    fn udf(
+        py: Python<'_>,
+        func: Py<PyAny>,
+        input_fields: Bound<'_, PyAny>,
+        return_field: Bound<'_, PyAny>,
+        volatility: Bound<'_, PyAny>,
+        name: Option<String>,
+    ) -> PyResult<Self> {
+        let name = match name {
+            Some(name) => name,
+            None => default_udf_name(py, &func)?,
+        };
+        Self::create(py, name, func, &input_fields, &return_field, &volatility)
+    }
+
+    #[getter]
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ScalarUDF({})", self.name)
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (func, input_fields, return_field, volatility, name = None))]
+fn udf(
+    py: Python<'_>,
+    func: Py<PyAny>,
+    input_fields: Bound<'_, PyAny>,
+    return_field: Bound<'_, PyAny>,
+    volatility: Bound<'_, PyAny>,
+    name: Option<String>,
+) -> PyResult<PyScalarUDFObject> {
+    PyScalarUDFObject::udf(py, func, input_fields, return_field, volatility, name)
 }
 
 impl Debug for PyScalarUDF {
@@ -129,6 +281,7 @@ impl Debug for PyScalarUDF {
             .field("name", &self.name)
             .field("input_types", &self.input_types)
             .field("return_type", &self.return_type)
+            .field("volatility", &self.volatility)
             .finish_non_exhaustive()
     }
 }
@@ -138,6 +291,7 @@ impl PartialEq for PyScalarUDF {
         self.name == other.name
             && self.input_types == other.input_types
             && self.return_type == other.return_type
+            && self.volatility == other.volatility
     }
 }
 
@@ -148,6 +302,7 @@ impl Hash for PyScalarUDF {
         self.name.hash(state);
         self.input_types.hash(state);
         self.return_type.hash(state);
+        self.volatility.hash(state);
     }
 }
 
@@ -299,25 +454,8 @@ impl PySQLContext {
             .map_err(df_to_py_err)
     }
 
-    fn register_scalar_function(
-        &self,
-        py: Python<'_>,
-        name: String,
-        func: Py<PyAny>,
-        input_types: Vec<String>,
-        return_type: String,
-    ) -> PyResult<()> {
-        if !func.bind(py).is_callable() {
-            return Err(PyTypeError::new_err("func must be callable"));
-        }
-
-        let input_types = input_types
-            .iter()
-            .map(|type_name| parse_arrow_type(type_name))
-            .collect::<PyResult<Vec<_>>>()?;
-        let return_type = parse_arrow_type(&return_type)?;
-        let udf = PyScalarUDF::new(name, func, input_types, return_type);
-        self.inner.ctx().register_udf(ScalarUDF::new_from_impl(udf));
+    fn register_udf(&self, udf: &PyScalarUDFObject) -> PyResult<()> {
+        self.inner.ctx().register_udf(udf.udf.clone());
         Ok(())
     }
 
@@ -339,7 +477,9 @@ impl PySQLContext {
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "datafusion")?;
     this.add_class::<PaimonCatalog>()?;
+    this.add_class::<PyScalarUDFObject>()?;
     this.add_class::<PySQLContext>()?;
+    this.add_function(wrap_pyfunction!(udf, &this)?)?;
     m.add_submodule(&this)?;
     py.import("sys")?
         .getattr("modules")?

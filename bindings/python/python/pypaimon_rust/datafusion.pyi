@@ -15,13 +15,54 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Sequence, TypeAlias, Union
 
 import pyarrow
+
+ArrowTypeLike: TypeAlias = Union[pyarrow.DataType, pyarrow.Field, str]
+InputFieldsLike: TypeAlias = Union[ArrowTypeLike, Sequence[ArrowTypeLike]]
+VolatilityLike: TypeAlias = Union[str, Any]
 
 class PaimonCatalog:
     def __init__(self, catalog_options: Dict[str, str]) -> None: ...
     def __datafusion_catalog_provider__(self, session: Any) -> object: ...
+
+class ScalarUDF:
+    def __init__(
+        self,
+        name: str,
+        func: Callable[..., pyarrow.Array],
+        input_fields: InputFieldsLike,
+        return_field: ArrowTypeLike,
+        volatility: VolatilityLike,
+    ) -> None: ...
+    @staticmethod
+    def udf(
+        func: Callable[..., pyarrow.Array],
+        input_fields: InputFieldsLike,
+        return_field: ArrowTypeLike,
+        volatility: VolatilityLike,
+        name: Optional[str] = None,
+    ) -> "ScalarUDF": ...
+    @property
+    def name(self) -> str: ...
+
+def udf(
+    func: Callable[..., pyarrow.Array],
+    input_fields: InputFieldsLike,
+    return_field: ArrowTypeLike,
+    volatility: VolatilityLike,
+    name: Optional[str] = None,
+) -> ScalarUDF:
+    """
+    Create a scalar UDF.
+
+    This mirrors DataFusion Python's function-style API:
+    ``udf(func, input_fields, return_field, volatility, name)``.
+    ``input_fields`` and ``return_field`` accept PyArrow DataType or Field
+    values. String type names remain accepted for compatibility.
+    """
+    ...
 
 class SQLContext:
     def __init__(self) -> None: ...
@@ -31,22 +72,5 @@ class SQLContext:
     def set_current_catalog(self, catalog_name: str) -> None: ...
     def set_current_database(self, database_name: str) -> None: ...
     def register_batch(self, name: str, batch: pyarrow.RecordBatch) -> None: ...
-    def register_scalar_function(
-        self,
-        name: str,
-        func: Callable[..., pyarrow.Array],
-        input_types: List[str],
-        return_type: str,
-    ) -> None:
-        """
-        Register a Python scalar UDF.
-
-        The callable receives one PyArrow Array per argument and must return a
-        PyArrow Array with the declared return type and the same row count.
-        Supported type names are: boolean, int8, int16, int32, int64,
-        float32, float64, string, large_string, binary, and large_binary.
-        Aliases such as bool, int, bigint, long, float, double, utf8,
-        large_utf8 are also accepted.
-        """
-        ...
+    def register_udf(self, udf: ScalarUDF) -> None: ...
     def sql(self, sql: str) -> List[pyarrow.RecordBatch]: ...
