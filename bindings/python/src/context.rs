@@ -323,9 +323,11 @@ impl PySQLContext {
 
     fn sql(&self, py: Python<'_>, sql: String) -> PyResult<Vec<Py<PyAny>>> {
         let rt = runtime();
-        let batches = rt.block_on(async {
-            let df = self.inner.sql(&sql).await.map_err(df_to_py_err)?;
-            df.collect().await.map_err(df_to_py_err)
+        let batches = py.detach(|| {
+            rt.block_on(async {
+                let df = self.inner.sql(&sql).await.map_err(df_to_py_err)?;
+                df.collect().await.map_err(df_to_py_err)
+            })
         })?;
         batches
             .iter()

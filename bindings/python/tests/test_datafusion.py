@@ -105,7 +105,7 @@ def test_register_scalar_function_from_python():
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
 
-        batch = pa.record_batch([[1, 2, 3]], names=["id"])
+        batch = pa.record_batch([[1, None, 3]], names=["id"])
         ctx.register_batch("my_temp", batch)
 
         def plus_ten(values):
@@ -116,11 +116,120 @@ def test_register_scalar_function_from_python():
 
         ctx.register_scalar_function("plus_ten", plus_ten, ["int64"], "int64")
 
-        batches = ctx.sql("SELECT plus_ten(id) AS id FROM paimon.default.my_temp ORDER BY id")
+        batches = ctx.sql(
+            "SELECT plus_ten(id) AS id FROM paimon.default.my_temp ORDER BY id"
+        )
         table = pa.Table.from_batches(batches)
-        assert table["id"].to_pylist() == [11, 12, 13]
+        assert table["id"].to_pylist() == [11, 13, None]
 
         ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
+
+
+def test_register_scalar_function_multi_input_plan():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+
+        batch = pa.record_batch([[1, 2, 3]], names=["id"])
+        ctx.register_batch("my_temp", batch)
+
+        def plus_ten(values):
+            return pa.array([value + 10 for value in values.to_pylist()], type=pa.int64())
+
+        ctx.register_scalar_function("plus_ten", plus_ten, ["int64"], "int64")
+
+        batches = ctx.sql(
+            """
+            SELECT plus_ten(id) AS id FROM paimon.default.my_temp
+            UNION ALL
+            SELECT plus_ten(id) AS id FROM paimon.default.my_temp
+            ORDER BY id
+            """
+        )
+        table = pa.Table.from_batches(batches)
+        assert table["id"].to_pylist() == [11, 11, 12, 12, 13, 13]
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
+
+
+def test_register_scalar_function_rejects_non_callable():
+    ctx = SQLContext()
+    try:
+        ctx.register_scalar_function("bad", 1, ["int64"], "int64")
+        assert False, "expected non-callable UDF registration to fail"
+    except TypeError as e:
+        assert "func must be callable" in str(e)
+
+
+def test_register_scalar_function_rejects_unsupported_type():
+    ctx = SQLContext()
+
+    def identity(values):
+        return values
+
+    try:
+        ctx.register_scalar_function("identity", identity, ["date32"], "date32")
+        assert False, "expected unsupported type registration to fail"
+    except TypeError as e:
+        assert "Unsupported Arrow type" in str(e)
+
+
+def test_python_scalar_function_exception_surfaces():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.register_batch("my_temp", pa.record_batch([[1]], names=["id"]))
+
+        def boom(values):
+            raise RuntimeError("boom")
+
+        ctx.register_scalar_function("boom", boom, ["int64"], "int64")
+
+        try:
+            ctx.sql("SELECT boom(id) AS id FROM paimon.default.my_temp")
+            assert False, "expected Python UDF exception to fail the query"
+        except Exception as e:
+            message = str(e)
+            assert "Python UDF 'boom' failed" in message
+            assert "boom" in message
+
+
+def test_python_scalar_function_rejects_wrong_length():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.register_batch("my_temp", pa.record_batch([[1, 2]], names=["id"]))
+
+        def wrong_length(values):
+            return pa.array([1], type=pa.int64())
+
+        ctx.register_scalar_function("wrong_length", wrong_length, ["int64"], "int64")
+
+        try:
+            ctx.sql("SELECT wrong_length(id) AS id FROM paimon.default.my_temp")
+            assert False, "expected wrong-length UDF result to fail the query"
+        except Exception as e:
+            message = str(e)
+            assert "Python UDF 'wrong_length' returned 1 rows, expected 2" in message
+
+
+def test_python_scalar_function_rejects_wrong_type():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.register_batch("my_temp", pa.record_batch([[1]], names=["id"]))
+
+        def wrong_type(values):
+            return pa.array(["not an int"], type=pa.string())
+
+        ctx.register_scalar_function("wrong_type", wrong_type, ["int64"], "int64")
+
+        try:
+            ctx.sql("SELECT wrong_type(id) AS id FROM paimon.default.my_temp")
+            assert False, "expected wrong-type UDF result to fail the query"
+        except Exception as e:
+            message = str(e)
+            assert "Python UDF 'wrong_type' returned Utf8, expected Int64" in message
 
 
 def test_temp_table_shadows_paimon_table():

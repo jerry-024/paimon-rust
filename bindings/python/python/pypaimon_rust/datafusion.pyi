@@ -37,5 +37,16 @@ class SQLContext:
         func: Callable[..., pyarrow.Array],
         input_types: List[str],
         return_type: str,
-    ) -> None: ...
+    ) -> None:
+        """
+        Register a Python scalar UDF.
+
+        The callable receives one PyArrow Array per argument and must return a
+        PyArrow Array with the declared return type and the same row count.
+        Supported type names are: boolean, int8, int16, int32, int64,
+        float32, float64, string, large_string, binary, and large_binary.
+        Aliases such as bool, int, bigint, long, float, double, utf8,
+        large_utf8 are also accepted.
+        """
+        ...
     def sql(self, sql: str) -> List[pyarrow.RecordBatch]: ...
