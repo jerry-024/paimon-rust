@@ -17,6 +17,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::common::options::parse_memory_size as parse_memory_size_result;
+
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DELETION_VECTORS_MERGE_ON_READ_OPTION: &str = "deletion-vectors.merge-on-read";
 pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
@@ -1379,25 +1381,7 @@ impl<'a> CoreOptions<'a> {
 /// an unrecognized unit, or a value that would overflow `i64`, matching the
 /// inputs on which Java throws.
 fn parse_memory_size(value: &str) -> Option<i64> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    let pos = value
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(value.len());
-    let (num_str, unit_str) = value.split_at(pos);
-    let num: i64 = num_str.trim().parse().ok()?;
-    let multiplier = match unit_str.trim().to_ascii_lowercase().as_str() {
-        "" | "b" | "bytes" => 1,
-        "k" | "kb" | "kibibytes" => 1024,
-        "m" | "mb" | "mebibytes" => 1024 * 1024,
-        "g" | "gb" | "gibibytes" => 1024 * 1024 * 1024,
-        "t" | "tb" | "tebibytes" => 1024 * 1024 * 1024 * 1024,
-        _ => return None,
-    };
-    num.checked_mul(multiplier)
+    parse_memory_size_result(value).ok()
 }
 
 /// Parse a duration string to milliseconds, mirroring Java Paimon's
@@ -1879,15 +1863,19 @@ mod tests {
             ("bytes", 1),
             ("k", 1024),
             ("kb", 1024),
+            ("kib", 1024),
             ("kibibytes", 1024),
             ("m", 1024 * 1024),
             ("mb", 1024 * 1024),
+            ("mib", 1024 * 1024),
             ("mebibytes", 1024 * 1024),
             ("g", 1024 * 1024 * 1024),
             ("gb", 1024 * 1024 * 1024),
+            ("gib", 1024 * 1024 * 1024),
             ("gibibytes", 1024 * 1024 * 1024),
             ("t", 1024_i64 * 1024 * 1024 * 1024),
             ("tb", 1024_i64 * 1024 * 1024 * 1024),
+            ("tib", 1024_i64 * 1024 * 1024 * 1024),
             ("tebibytes", 1024_i64 * 1024 * 1024 * 1024),
         ] {
             assert_eq!(

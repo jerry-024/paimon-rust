@@ -109,7 +109,7 @@ mod tests {
                 FileType::GlobalIndex,
             ),
             (
-                "s3://bucket/table/index/vector-ivf-global-index-abc.index",
+                "s3://bucket/table/index/vector-ivf-pq-global-index-abc.index",
                 FileType::GlobalIndex,
             ),
             ("s3://bucket/table/index/index-abc-0", FileType::BucketIndex),
