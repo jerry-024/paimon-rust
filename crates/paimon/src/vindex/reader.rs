@@ -30,37 +30,58 @@ const DEFAULT_NPROBE: usize = 16;
 const NPROBE_PARAMETER: &str = "ivf.nprobe";
 const NATIVE_BATCH_PROCESS_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
 // Native searches run on dedicated executor threads, so blocking here does not block async I/O.
-static NATIVE_BATCH_AVAILABLE_BYTES: Mutex<usize> =
-    Mutex::new(NATIVE_BATCH_PROCESS_WORKING_SET_BYTES);
-static NATIVE_BATCH_MEMORY_AVAILABLE: Condvar = Condvar::new();
+static NATIVE_BATCH_MEMORY_POOL: NativeBatchMemoryPool =
+    NativeBatchMemoryPool::new(NATIVE_BATCH_PROCESS_WORKING_SET_BYTES);
 
-struct NativeBatchMemoryPermit {
+struct NativeBatchMemoryPool {
+    available_bytes: Mutex<usize>,
+    memory_available: Condvar,
+}
+
+impl NativeBatchMemoryPool {
+    const fn new(bytes: usize) -> Self {
+        Self {
+            available_bytes: Mutex::new(bytes),
+            memory_available: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, bytes: usize) -> NativeBatchMemoryPermit<'_> {
+        let mut available = self
+            .available_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *available < bytes {
+            available = self
+                .memory_available
+                .wait(available)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *available -= bytes;
+        NativeBatchMemoryPermit { pool: self, bytes }
+    }
+}
+
+struct NativeBatchMemoryPermit<'a> {
+    pool: &'a NativeBatchMemoryPool,
     bytes: usize,
 }
 
-impl Drop for NativeBatchMemoryPermit {
+impl Drop for NativeBatchMemoryPermit<'_> {
     fn drop(&mut self) {
-        let mut available = NATIVE_BATCH_AVAILABLE_BYTES
+        let mut available = self
+            .pool
+            .available_bytes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *available += self.bytes;
         drop(available);
-        NATIVE_BATCH_MEMORY_AVAILABLE.notify_all();
+        self.pool.memory_available.notify_all();
     }
 }
 
-fn acquire_native_batch_memory(index_parallelism: usize) -> NativeBatchMemoryPermit {
-    let bytes = native_batch_memory_reservation(index_parallelism);
-    let mut available = NATIVE_BATCH_AVAILABLE_BYTES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    while *available < bytes {
-        available = NATIVE_BATCH_MEMORY_AVAILABLE
-            .wait(available)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-    }
-    *available -= bytes;
-    NativeBatchMemoryPermit { bytes }
+fn acquire_native_batch_memory(bytes: usize) -> NativeBatchMemoryPermit<'static> {
+    NATIVE_BATCH_MEMORY_POOL.acquire(bytes)
 }
 
 fn native_batch_memory_reservation(index_parallelism: usize) -> usize {
@@ -400,8 +421,6 @@ fn search_batch_vindex(
 
     for (prepared, indices) in groups {
         let chunk_size = native_batch_chunk_size(metadata, &prepared, index_parallelism);
-        let _memory_permit = (chunk_size > 1 && indices.len() > 1)
-            .then(|| acquire_native_batch_memory(index_parallelism));
         for indices in indices.chunks(chunk_size) {
             if indices.len() == 1 {
                 let index = indices[0];
@@ -414,6 +433,10 @@ fn search_batch_vindex(
                 continue;
             }
 
+            let reservation =
+                native_batch_chunk_working_set_bytes(metadata, &prepared, indices.len());
+            debug_assert!(reservation <= native_batch_memory_reservation(index_parallelism));
+            let _memory_permit = acquire_native_batch_memory(reservation);
             let mut queries = Vec::with_capacity(indices.len() * metadata.dimension);
             for &index in indices {
                 queries.extend_from_slice(&vector_searches[index].vector);
@@ -469,15 +492,29 @@ fn native_batch_chunk_size(
     index_parallelism: usize,
 ) -> usize {
     let per_index_budget = native_batch_memory_reservation(index_parallelism);
-    let filter_bytes = prepared
-        .filter_bytes
-        .as_ref()
-        .map_or(0, |filter| filter.len().saturating_mul(2));
+    let filter_bytes = native_batch_filter_working_set_bytes(prepared);
     let query_budget = per_index_budget.saturating_sub(filter_bytes);
     query_budget
         .checked_div(native_batch_query_working_set_bytes(metadata, prepared))
         .unwrap_or(0)
         .max(1)
+}
+
+fn native_batch_chunk_working_set_bytes(
+    metadata: &VectorIndexMetadata,
+    prepared: &PreparedSearch,
+    query_count: usize,
+) -> usize {
+    native_batch_filter_working_set_bytes(prepared).saturating_add(
+        query_count.saturating_mul(native_batch_query_working_set_bytes(metadata, prepared)),
+    )
+}
+
+fn native_batch_filter_working_set_bytes(prepared: &PreparedSearch) -> usize {
+    prepared
+        .filter_bytes
+        .as_ref()
+        .map_or(0, |filter| filter.len().saturating_mul(2))
 }
 
 fn native_batch_query_working_set_bytes(
@@ -824,6 +861,67 @@ mod tests {
                     <= NATIVE_BATCH_PROCESS_WORKING_SET_BYTES
             );
         }
+    }
+
+    #[test]
+    fn native_batch_chunk_reservation_tracks_actual_chunk() {
+        let metadata = VectorIndexMetadata {
+            index_type: paimon_vindex_core::index::IndexType::IvfFlat,
+            dimension: 128,
+            nlist: 256,
+            metric: MetricType::L2,
+            total_vectors: 8192,
+            pq_m: None,
+            pq_bits: None,
+            rq_bits: None,
+            diskann: None,
+        };
+        let prepared = PreparedSearch {
+            top_k: 10,
+            nprobe: 16,
+            filter_bytes: Some(vec![0; 128]),
+        };
+        let chunk_size = native_batch_chunk_size(&metadata, &prepared, 1);
+        let full_chunk = native_batch_chunk_working_set_bytes(&metadata, &prepared, chunk_size);
+        let final_chunk = native_batch_chunk_working_set_bytes(&metadata, &prepared, 2);
+
+        assert!(chunk_size > 2);
+        assert!(full_chunk <= native_batch_memory_reservation(1));
+        assert!(final_chunk < full_chunk);
+    }
+
+    #[test]
+    fn native_batch_memory_pool_admits_only_available_bytes() {
+        let pool = NativeBatchMemoryPool::new(64);
+        let large = pool.acquire(48);
+
+        std::thread::scope(|scope| {
+            let (fits_tx, fits_rx) = std::sync::mpsc::channel();
+            scope.spawn(|| {
+                let _permit = pool.acquire(16);
+                fits_tx.send(()).unwrap();
+            });
+            fits_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("reservation fitting the available bytes should not wait");
+
+            let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+            scope.spawn(|| {
+                let _permit = pool.acquire(17);
+                blocked_tx.send(()).unwrap();
+            });
+            assert!(
+                blocked_rx
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err(),
+                "reservation exceeding the available bytes should wait"
+            );
+
+            drop(large);
+            blocked_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("waiting reservation should proceed after bytes are released");
+        });
     }
 
     #[test]
