@@ -636,7 +636,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_many_caps_each_batch_at_32_ranges() {
         let range_count = RANGE_READ_CONCURRENCY + 1;
-        let stride = RANGE_COALESCE_GAP + 1;
+        let stride = RANGE_COALESCE_GAP + 2;
         let data = Bytes::from(vec![8u8; range_count * stride as usize]);
         let tracking = Arc::new(ConcurrencyTrackingRead {
             data: data.clone(),

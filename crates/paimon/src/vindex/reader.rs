@@ -24,10 +24,48 @@ use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities};
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::io;
+use std::sync::{Condvar, Mutex};
 
 const DEFAULT_NPROBE: usize = 16;
 const NPROBE_PARAMETER: &str = "ivf.nprobe";
-const NATIVE_BATCH_OPERATION_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
+const NATIVE_BATCH_PROCESS_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
+// Native searches run on dedicated executor threads, so blocking here does not block async I/O.
+static NATIVE_BATCH_AVAILABLE_BYTES: Mutex<usize> =
+    Mutex::new(NATIVE_BATCH_PROCESS_WORKING_SET_BYTES);
+static NATIVE_BATCH_MEMORY_AVAILABLE: Condvar = Condvar::new();
+
+struct NativeBatchMemoryPermit {
+    bytes: usize,
+}
+
+impl Drop for NativeBatchMemoryPermit {
+    fn drop(&mut self) {
+        let mut available = NATIVE_BATCH_AVAILABLE_BYTES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *available += self.bytes;
+        drop(available);
+        NATIVE_BATCH_MEMORY_AVAILABLE.notify_all();
+    }
+}
+
+fn acquire_native_batch_memory(index_parallelism: usize) -> NativeBatchMemoryPermit {
+    let bytes = native_batch_memory_reservation(index_parallelism);
+    let mut available = NATIVE_BATCH_AVAILABLE_BYTES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while *available < bytes {
+        available = NATIVE_BATCH_MEMORY_AVAILABLE
+            .wait(available)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    *available -= bytes;
+    NativeBatchMemoryPermit { bytes }
+}
+
+fn native_batch_memory_reservation(index_parallelism: usize) -> usize {
+    NATIVE_BATCH_PROCESS_WORKING_SET_BYTES / index_parallelism.max(1)
+}
 
 trait ErasedSeekRead: Send {
     fn pread_erased(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()>;
@@ -362,6 +400,8 @@ fn search_batch_vindex(
 
     for (prepared, indices) in groups {
         let chunk_size = native_batch_chunk_size(metadata, &prepared, index_parallelism);
+        let _memory_permit = (chunk_size > 1 && indices.len() > 1)
+            .then(|| acquire_native_batch_memory(index_parallelism));
         for indices in indices.chunks(chunk_size) {
             if indices.len() == 1 {
                 let index = indices[0];
@@ -428,9 +468,7 @@ fn native_batch_chunk_size(
     prepared: &PreparedSearch,
     index_parallelism: usize,
 ) -> usize {
-    let per_index_budget = NATIVE_BATCH_OPERATION_WORKING_SET_BYTES
-        .checked_div(index_parallelism.max(1))
-        .unwrap_or(0);
+    let per_index_budget = native_batch_memory_reservation(index_parallelism);
     let filter_bytes = prepared
         .filter_bytes
         .as_ref()
@@ -778,8 +816,14 @@ mod tests {
         ));
         assert!(
             per_index_working_set.saturating_mul(index_parallelism)
-                <= NATIVE_BATCH_OPERATION_WORKING_SET_BYTES
+                <= NATIVE_BATCH_PROCESS_WORKING_SET_BYTES
         );
+        for parallelism in [1, 2, 3, 32, 64] {
+            assert!(
+                native_batch_memory_reservation(parallelism).saturating_mul(parallelism)
+                    <= NATIVE_BATCH_PROCESS_WORKING_SET_BYTES
+            );
+        }
     }
 
     #[test]
