@@ -896,8 +896,9 @@ mod tests {
         let large = pool.acquire(48);
 
         std::thread::scope(|scope| {
+            let pool = &pool;
             let (fits_tx, fits_rx) = std::sync::mpsc::channel();
-            scope.spawn(|| {
+            scope.spawn(move || {
                 let _permit = pool.acquire(16);
                 fits_tx.send(()).unwrap();
             });
@@ -906,7 +907,7 @@ mod tests {
                 .expect("reservation fitting the available bytes should not wait");
 
             let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
-            scope.spawn(|| {
+            scope.spawn(move || {
                 let _permit = pool.acquire(17);
                 blocked_tx.send(()).unwrap();
             });
