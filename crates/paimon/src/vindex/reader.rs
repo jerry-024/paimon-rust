@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::spec::CoreOptions;
 use crate::vector_search::{GlobalIndexIOMeta, VectorSearch};
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
@@ -78,7 +77,7 @@ impl SeekRead for VindexInput {
 pub struct VindexVectorGlobalIndexReader {
     io_meta: GlobalIndexIOMeta,
     options: HashMap<String, String>,
-    batch_shard_concurrency: Option<usize>,
+    batch_index_parallelism: usize,
     reader: Option<VIndexReader<VindexInput>>,
     metadata: Option<VectorIndexMetadata>,
 }
@@ -88,14 +87,14 @@ impl VindexVectorGlobalIndexReader {
         Self {
             io_meta,
             options,
-            batch_shard_concurrency: None,
+            batch_index_parallelism: 1,
             reader: None,
             metadata: None,
         }
     }
 
-    pub(crate) fn with_batch_shard_concurrency(mut self, concurrency: usize) -> Self {
-        self.batch_shard_concurrency = Some(concurrency.max(1));
+    pub(crate) fn with_batch_index_parallelism(mut self, parallelism: usize) -> Self {
+        self.batch_index_parallelism = parallelism.max(1);
         self
     }
 
@@ -150,10 +149,6 @@ impl VindexVectorGlobalIndexReader {
         &mut self,
         vector_searches: &[VectorSearch],
     ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
-        let shard_concurrency = match self.batch_shard_concurrency {
-            Some(concurrency) => concurrency,
-            None => CoreOptions::new(&self.options).global_index_thread_num()?,
-        };
         let reader = self
             .reader
             .as_mut()
@@ -173,7 +168,7 @@ impl VindexVectorGlobalIndexReader {
             metadata,
             &self.options,
             vector_searches,
-            shard_concurrency,
+            self.batch_index_parallelism,
         )
     }
 
@@ -348,7 +343,7 @@ fn search_batch_vindex(
     metadata: &VectorIndexMetadata,
     options: &HashMap<String, String>,
     vector_searches: &[VectorSearch],
-    shard_concurrency: usize,
+    index_parallelism: usize,
 ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
     let mut results: Vec<Option<HashMap<u64, f32>>> =
         (0..vector_searches.len()).map(|_| None).collect();
@@ -366,7 +361,7 @@ fn search_batch_vindex(
     }
 
     for (prepared, indices) in groups {
-        let chunk_size = native_batch_chunk_size(metadata, &prepared, shard_concurrency);
+        let chunk_size = native_batch_chunk_size(metadata, &prepared, index_parallelism);
         for indices in indices.chunks(chunk_size) {
             if indices.len() == 1 {
                 let index = indices[0];
@@ -431,16 +426,16 @@ fn search_batch_vindex(
 fn native_batch_chunk_size(
     metadata: &VectorIndexMetadata,
     prepared: &PreparedSearch,
-    shard_concurrency: usize,
+    index_parallelism: usize,
 ) -> usize {
-    let per_shard_budget = NATIVE_BATCH_OPERATION_WORKING_SET_BYTES
-        .checked_div(shard_concurrency.max(1))
+    let per_index_budget = NATIVE_BATCH_OPERATION_WORKING_SET_BYTES
+        .checked_div(index_parallelism.max(1))
         .unwrap_or(0);
     let filter_bytes = prepared
         .filter_bytes
         .as_ref()
         .map_or(0, |filter| filter.len().saturating_mul(2));
-    let query_budget = per_shard_budget.saturating_sub(filter_bytes);
+    let query_budget = per_index_budget.saturating_sub(filter_bytes);
     query_budget
         .checked_div(native_batch_query_working_set_bytes(metadata, prepared))
         .unwrap_or(0)
@@ -669,7 +664,7 @@ mod tests {
             index,
             query_count,
             HashMap::from([(NPROBE_PARAMETER.to_string(), "1".to_string())]),
-            32,
+            1,
         )
         .await
     }
@@ -678,7 +673,7 @@ mod tests {
         index: Bytes,
         query_count: usize,
         options: HashMap<String, String>,
-        shard_concurrency: usize,
+        index_parallelism: usize,
     ) -> (Vec<Option<HashMap<u64, f32>>>, usize) {
         let tracking = TrackingIndexRead::new(index.clone());
         let source: Arc<dyn FileRead> = tracking.clone();
@@ -694,7 +689,7 @@ mod tests {
                 GlobalIndexIOMeta::new("batch.index".to_string(), index.len() as u64, Vec::new());
             let searches = vec![query(); query_count];
             let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options)
-                .with_batch_shard_concurrency(shard_concurrency);
+                .with_batch_index_parallelism(index_parallelism);
             reader
                 .visit_batch_vector_search(&searches, |_| Ok(source))
                 .unwrap()
@@ -760,23 +755,31 @@ mod tests {
             nprobe: 16,
             filter_bytes: None,
         };
-        let base = native_batch_chunk_size(&base_metadata, &base_prepared, 32);
+        let index_parallelism = 32;
+        let base = native_batch_chunk_size(&base_metadata, &base_prepared, index_parallelism);
 
         let mut larger_index = base_metadata.clone();
         larger_index.dimension *= 2;
         larger_index.nlist *= 2;
-        assert!(native_batch_chunk_size(&larger_index, &base_prepared, 32) < base);
+        assert!(native_batch_chunk_size(&larger_index, &base_prepared, index_parallelism) < base);
 
         let mut larger_top_k = base_prepared.clone();
         larger_top_k.top_k *= 4;
-        assert!(native_batch_chunk_size(&base_metadata, &larger_top_k, 32) < base);
+        assert!(native_batch_chunk_size(&base_metadata, &larger_top_k, index_parallelism) < base);
 
         let mut pq_metadata = base_metadata.clone();
         pq_metadata.pq_m = Some(64);
         pq_metadata.pq_bits = Some(8);
-        assert!(native_batch_chunk_size(&pq_metadata, &base_prepared, 32) < base);
+        assert!(native_batch_chunk_size(&pq_metadata, &base_prepared, index_parallelism) < base);
 
-        assert!(native_batch_chunk_size(&base_metadata, &base_prepared, 64) < base);
+        let per_index_working_set = base.saturating_mul(native_batch_query_working_set_bytes(
+            &base_metadata,
+            &base_prepared,
+        ));
+        assert!(
+            per_index_working_set.saturating_mul(index_parallelism)
+                <= NATIVE_BATCH_OPERATION_WORKING_SET_BYTES
+        );
     }
 
     #[test]
@@ -1094,7 +1097,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn homogeneous_batch_chunks_at_working_set_boundary() {
-        let shard_concurrency = 4096;
+        let index_parallelism = 4096;
         let metadata = VectorIndexMetadata {
             index_type: paimon_vindex_core::index::IndexType::IvfFlat,
             dimension: TEST_DIMENSION,
@@ -1113,7 +1116,7 @@ mod tests {
         let prepared = prepare_search(&metadata, &options, &query())
             .unwrap()
             .unwrap();
-        let chunk_size = native_batch_chunk_size(&metadata, &prepared, shard_concurrency);
+        let chunk_size = native_batch_chunk_size(&metadata, &prepared, index_parallelism);
         assert!(chunk_size > 16);
 
         let index = build_ivf_flat_index();
@@ -1121,11 +1124,11 @@ mod tests {
             index.clone(),
             chunk_size,
             options.clone(),
-            shard_concurrency,
+            index_parallelism,
         )
         .await;
         let (over_results, over_bytes) =
-            tracked_batch_search_with_options(index, chunk_size + 1, options, shard_concurrency)
+            tracked_batch_search_with_options(index, chunk_size + 1, options, index_parallelism)
                 .await;
 
         assert_eq!(within_results.len(), chunk_size);
