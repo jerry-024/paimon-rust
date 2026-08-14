@@ -121,7 +121,7 @@ impl DiskCache {
         };
     }
 
-    async fn ensure_recovered(&self) {
+    pub(super) async fn ensure_recovered(&self) {
         self.recovered
             .get_or_init(|| async {
                 let root = self.root.clone();

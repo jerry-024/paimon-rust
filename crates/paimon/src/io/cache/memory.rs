@@ -16,7 +16,7 @@
 // under the License.
 
 use bytes::Bytes;
-use indexmap::IndexMap;
+use lru::LruCache;
 use std::sync::Mutex;
 
 use super::state::BlockKey;
@@ -26,9 +26,9 @@ pub(super) struct MemoryCache {
     state: Mutex<MemoryState>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MemoryState {
-    entries: IndexMap<BlockKey, Bytes>,
+    entries: LruCache<BlockKey, Bytes>,
     current_size: u64,
     max_size: Option<u64>,
 }
@@ -37,17 +37,16 @@ impl MemoryCache {
     pub(super) fn new(max_size: Option<u64>) -> Self {
         Self {
             state: Mutex::new(MemoryState {
+                entries: LruCache::unbounded(),
+                current_size: 0,
                 max_size,
-                ..MemoryState::default()
             }),
         }
     }
 
     pub(super) fn get_block(&self, key: &BlockKey) -> Option<Bytes> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let payload = state.entries.shift_remove(key)?;
-        state.entries.insert(key.clone(), payload.clone());
-        Some(payload)
+        state.entries.get(key).cloned()
     }
 
     pub(super) fn put_block(&self, key: &BlockKey, payload: Bytes) {
@@ -59,16 +58,15 @@ impl MemoryCache {
         {
             return;
         }
-        if let Some(previous) = state.entries.shift_remove(key) {
+        if let Some(previous) = state.entries.put(key.clone(), payload) {
             state.current_size = state.current_size.saturating_sub(previous.len() as u64);
         }
-        state.entries.insert(key.clone(), payload);
         state.current_size = state.current_size.saturating_add(payload_size);
         while state
             .max_size
             .is_some_and(|max_size| state.current_size > max_size)
         {
-            let Some((_, payload)) = state.entries.shift_remove_index(0) else {
+            let Some((_, payload)) = state.entries.pop_lru() else {
                 break;
             };
             state.current_size = state.current_size.saturating_sub(payload.len() as u64);
@@ -77,7 +75,7 @@ impl MemoryCache {
 
     pub(super) fn remove_block(&self, key: &BlockKey) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(payload) = state.entries.shift_remove(key) {
+        if let Some(payload) = state.entries.pop(key) {
             state.current_size = state.current_size.saturating_sub(payload.len() as u64);
         }
     }
@@ -95,12 +93,13 @@ impl MemoryCache {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let keys = state
             .entries
-            .keys()
+            .iter()
+            .map(|(key, _)| key)
             .filter(|key| matches(key))
             .cloned()
             .collect::<Vec<_>>();
         for key in keys {
-            if let Some(payload) = state.entries.shift_remove(&key) {
+            if let Some(payload) = state.entries.pop(&key) {
                 state.current_size = state.current_size.saturating_sub(payload.len() as u64);
             }
         }

@@ -171,6 +171,9 @@ impl LocalCache {
     }
 
     pub(super) async fn invalidate_prefix(&self, prefix: &str) {
+        if let CacheBackend::Disk(disk) = &self.backend {
+            disk.ensure_recovered().await;
+        }
         let _guard = self
             .coordinator
             .begin_prefix_invalidation(&self.namespace, prefix)
