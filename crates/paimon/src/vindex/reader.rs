@@ -34,6 +34,7 @@ static NATIVE_BATCH_MEMORY_POOL: NativeBatchMemoryPool =
     NativeBatchMemoryPool::new(NATIVE_BATCH_PROCESS_WORKING_SET_BYTES);
 
 struct NativeBatchMemoryPool {
+    capacity: usize,
     available_bytes: Mutex<usize>,
     memory_available: Condvar,
 }
@@ -41,12 +42,14 @@ struct NativeBatchMemoryPool {
 impl NativeBatchMemoryPool {
     const fn new(bytes: usize) -> Self {
         Self {
+            capacity: bytes,
             available_bytes: Mutex::new(bytes),
             memory_available: Condvar::new(),
         }
     }
 
     fn acquire(&self, bytes: usize) -> NativeBatchMemoryPermit<'_> {
+        let bytes = bytes.min(self.capacity);
         let mut available = self
             .available_bytes
             .lock()
@@ -922,6 +925,27 @@ mod tests {
             blocked_rx
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .expect("waiting reservation should proceed after bytes are released");
+        });
+    }
+
+    #[test]
+    fn native_batch_memory_pool_oversized_request_occupies_pool() {
+        let pool = NativeBatchMemoryPool::new(64);
+
+        std::thread::scope(|scope| {
+            let pool = &pool;
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let permit = pool.acquire(65);
+                let _ = acquired_tx.send(permit.bytes);
+            });
+            let acquired = acquired_rx.recv_timeout(std::time::Duration::from_secs(1));
+            if acquired.is_err() {
+                // Unblock the old behavior so a regression fails instead of hanging the test.
+                *pool.available_bytes.lock().unwrap() = 65;
+                pool.memory_available.notify_all();
+            }
+            assert_eq!(acquired.unwrap(), 64);
         });
     }
 
