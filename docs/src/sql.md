@@ -1087,8 +1087,8 @@ For procedure calls, prefer the index-prefixed option names shown above. Native
 vindex aliases are also accepted in the `options` string: `dimension`, `metric`,
 `nlist`, `pq.m`, `use-opq`, `rq.bits`, `max-bytes-per-vector`,
 `deployment-profile`, `target-recall`, `pq.code-ratio`, `pq.bits`, and the
-`diskann.*` build keys listed in the table. Options for another index family
-are rejected rather than ignored.
+`diskann.*` build keys listed in the table. Build options for another index
+family are rejected rather than ignored.
 
 Inspect committed index files with the `$table_indexes` system table:
 
@@ -1408,11 +1408,15 @@ SET 'paimon.ivf.nprobe' = '32';
 SELECT * FROM vector_search('paimon.my_db.items', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10);
 RESET 'paimon.ivf.nprobe';
 
--- DiskANN only; omit this option to use the automatic search width.
+-- DiskANN only; must be at least 1. Omit it to use the automatic search width.
 SET 'paimon.diskann.l_search' = '100';
 SELECT * FROM vector_search('paimon.my_db.items', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10);
 RESET 'paimon.diskann.l_search';
 ```
+
+Query options are index-family specific and non-applicable options are ignored:
+IVF readers consume only `ivf.nprobe`, while DiskANN readers consume only
+`diskann.l_search`. Setting both options is allowed; each index uses its own.
 
 `vindex.reader.memory-budget-bytes` sets the per-Reader resident-data and cache
 budget (default 4 GiB). It is distinct from the DiskANN build option

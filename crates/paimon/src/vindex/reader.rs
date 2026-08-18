@@ -450,10 +450,20 @@ fn prepare_search(
     }
     let mut params = match metadata.index_type {
         IndexType::DiskAnn => match options.get(L_SEARCH_PARAMETER) {
-            Some(_) => VectorSearchParams::with_l_search(
-                top_k,
-                int_parameter(options, L_SEARCH_PARAMETER, 0)?,
-            ),
+            Some(value) => {
+                let l_search = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!(
+                            "Invalid value for '{}': {}. Must be a positive integer.",
+                            L_SEARCH_PARAMETER, value
+                        ),
+                        source: None,
+                    })?;
+                VectorSearchParams::with_l_search(top_k, l_search)
+            }
             None => VectorSearchParams::automatic(top_k),
         },
         _ => VectorSearchParams::new(
@@ -663,7 +673,7 @@ fn native_batch_query_working_set_bytes(
     let top_k_results = prepared.params.top_k.saturating_mul(
         std::mem::size_of::<i64>() + std::mem::size_of::<f32>() + std::mem::size_of::<(f32, i64)>(),
     );
-    // ponytail: mirrors vindex 0.3's live frontier; use upstream scratch-byte reporting when exposed.
+    // TODO: Mirrors vindex 0.3's live frontier; use upstream scratch-byte reporting when exposed.
     let diskann_candidates = if metadata.index_type == IndexType::DiskAnn {
         prepared
             .params
@@ -1146,6 +1156,15 @@ mod tests {
             paimon_vindex_core::index::SearchWidth::DiskAnnLSearch
         );
         assert_eq!(explicit_params.width, 64);
+
+        let zero_l_search = prepare_search(
+            &metadata,
+            &HashMap::from([("diskann.l_search".to_string(), "0".to_string())]),
+            &query(),
+        )
+        .err()
+        .unwrap();
+        assert!(zero_l_search.to_string().contains("positive integer"));
 
         let mixed_options = HashMap::from([
             ("ivf.nprobe".to_string(), "4".to_string()),
