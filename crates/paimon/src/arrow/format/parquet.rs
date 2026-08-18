@@ -490,29 +490,36 @@ impl FormatFileReader for ParquetFormatReader {
         // preserving positional `_ROW_ID`, sort order, and batch backpressure. Reads
         // with predicates or an explicit row selection retain the original
         // single-stream path until their selections are split per row group.
-        let row_group_parallelism = self
-            .read_budget
-            .as_ref()
-            .filter(|_| preds.is_empty() && row_filter_factory.is_none() && row_selection.is_none())
+        let read_budget = self.read_budget.as_ref().filter(|_| {
+            preds.is_empty() && row_filter_factory.is_none() && row_selection.is_none()
+        });
+        let row_group_parallelism = read_budget
             .map(|budget| {
                 budget
                     .parallelism()
                     .min(batch_stream_builder.metadata().num_row_groups())
             })
             .unwrap_or(1);
+        let projected_bytes = read_budget
+            .filter(|budget| row_group_parallelism > 1 || budget.diagnostics_enabled())
+            .map(|budget| {
+                let projected_bytes = batch_stream_builder
+                    .metadata()
+                    .row_groups()
+                    .iter()
+                    .map(|row_group| projected_row_group_bytes(row_group, &mask))
+                    .collect::<Vec<_>>();
+                budget.record_projected_row_groups(&projected_bytes);
+                projected_bytes
+            });
         if row_group_parallelism > 1 {
             let row_group_count = batch_stream_builder.metadata().num_row_groups();
             let reader_metadata = ArrowReaderMetadata::try_new(
                 batch_stream_builder.metadata().clone(),
                 ArrowReaderOptions::new(),
             )?;
-            let projected_bytes = batch_stream_builder
-                .metadata()
-                .row_groups()
-                .iter()
-                .map(|row_group| projected_row_group_bytes(row_group, &mask))
-                .collect::<Vec<_>>();
-            let read_budget = Arc::clone(self.read_budget.as_ref().expect("checked above"));
+            let projected_bytes = projected_bytes.expect("parallel row-group reads need sizes");
+            let read_budget = Arc::clone(read_budget.expect("checked above"));
             let (row_group_tx, mut row_group_rx) = mpsc::channel(row_group_parallelism);
             tokio::spawn(async move {
                 for (row_group_index, projected_bytes) in projected_bytes.into_iter().enumerate() {
