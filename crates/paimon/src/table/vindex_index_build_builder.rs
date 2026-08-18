@@ -482,13 +482,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             });
         }
         let raw_file = raw_file.into_std().await;
-        let training_rows_retained =
-            default_training_vector_count(training_vector_count, options.config.nlist()).map_err(
-                |e| Error::DataInvalid {
-                    message: format!("Failed to determine retained vindex training vectors: {e}"),
-                    source: Some(Box::new(e)),
-                },
-            )?;
+        // Diagnostics only: never fail the build for a timing log field.
+        let training_rows_retained = if timing_enabled {
+            default_training_vector_count(training_vector_count, options.config.nlist())
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         let (writer, train_finish, raw_temp_reread, index_add) = tokio::task::spawn_blocking(
             move || -> std::io::Result<(VectorIndexWriter, Duration, Duration, Duration)> {
