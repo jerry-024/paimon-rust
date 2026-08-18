@@ -19,7 +19,8 @@ use crate::vector_search::{GlobalIndexIOMeta, VectorSearch};
 use crate::vindex::vector_search_timing_enabled;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
-    VectorIndexMetadata, VectorIndexReader as VIndexReader, VectorSearchParams,
+    IndexType, VectorIndexMetadata, VectorIndexReader as VIndexReader, VectorIndexReaderOptions,
+    VectorSearchParams,
 };
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities};
 use std::collections::BinaryHeap;
@@ -30,6 +31,8 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_NPROBE: usize = 16;
 const NPROBE_PARAMETER: &str = "ivf.nprobe";
+const L_SEARCH_PARAMETER: &str = "diskann.l-search";
+const READER_MEMORY_BUDGET_PARAMETER: &str = "vindex.reader.memory-budget-bytes";
 const NATIVE_BATCH_PROCESS_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
 // Native searches run on dedicated executor threads, so blocking here does not block async I/O.
 static NATIVE_BATCH_MEMORY_POOL: NativeBatchMemoryPool =
@@ -367,13 +370,17 @@ impl VindexVectorGlobalIndexReader {
         }
 
         let open_start = self.timing_enabled.then(Instant::now);
+        let reader_options = VectorIndexReaderOptions::new(int_parameter(
+            &self.options,
+            READER_MEMORY_BUDGET_PARAMETER,
+            VectorIndexReaderOptions::default().memory_budget_bytes,
+        )?);
         let source = stream_fn(&self.io_meta.file_path)?;
-        let mut reader = VIndexReader::open(VindexInput::new(source)).map_err(|e| {
-            crate::Error::DataInvalid {
+        let mut reader = VIndexReader::open_with_options(VindexInput::new(source), reader_options)
+            .map_err(|e| crate::Error::DataInvalid {
                 message: format!("Failed to open paimon-vindex-core reader: {}", e),
                 source: Some(Box::new(e)),
-            }
-        })?;
+            })?;
         let vindex_open = open_start.map_or(Duration::ZERO, |start| start.elapsed());
         let metadata_start = self.timing_enabled.then(Instant::now);
         let metadata = reader.metadata();
@@ -405,7 +412,7 @@ fn search_vindex(
         return Ok(None);
     };
     let (labels, distances) = execute_scalar_search(reader, vector_search, &prepared)?;
-    let id_to_scores = collect_results(&labels, &distances, prepared.top_k, metadata.metric);
+    let id_to_scores = collect_results(&labels, &distances, prepared.params.top_k, metadata.metric);
     if id_to_scores.is_empty() {
         return Ok(None);
     }
@@ -415,8 +422,7 @@ fn search_vindex(
 
 #[derive(Clone, PartialEq, Eq)]
 struct PreparedSearch {
-    top_k: usize,
-    nprobe: usize,
+    params: VectorSearchParams,
     filter_bytes: Option<Vec<u8>>,
 }
 
@@ -441,7 +447,39 @@ fn prepare_search(
     if top_k == 0 {
         return Ok(None);
     }
-    let nprobe = int_parameter(options, NPROBE_PARAMETER, DEFAULT_NPROBE)?;
+    let mut params = match metadata.index_type {
+        IndexType::DiskAnn => {
+            if options.contains_key(NPROBE_PARAMETER) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Option '{}' is not applicable to DiskANN indexes",
+                        NPROBE_PARAMETER
+                    ),
+                });
+            }
+            match options.get(L_SEARCH_PARAMETER) {
+                Some(_) => VectorSearchParams::with_l_search(
+                    top_k,
+                    int_parameter(options, L_SEARCH_PARAMETER, 0)?,
+                ),
+                None => VectorSearchParams::automatic(top_k),
+            }
+        }
+        _ => {
+            if options.contains_key(L_SEARCH_PARAMETER) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Option '{}' is only applicable to DiskANN indexes",
+                        L_SEARCH_PARAMETER
+                    ),
+                });
+            }
+            VectorSearchParams::new(
+                top_k,
+                int_parameter(options, NPROBE_PARAMETER, DEFAULT_NPROBE)?,
+            )
+        }
+    };
 
     let filter_bytes = if let Some(include_ids) = &vector_search.include_row_ids {
         if include_ids.is_empty() {
@@ -459,10 +497,10 @@ fn prepare_search(
     } else {
         None
     };
+    params.top_k = top_k;
 
     Ok(Some(PreparedSearch {
-        top_k,
-        nprobe,
+        params,
         filter_bytes,
     }))
 }
@@ -472,7 +510,7 @@ fn execute_scalar_search(
     vector_search: &VectorSearch,
     prepared: &PreparedSearch,
 ) -> crate::Result<(Vec<i64>, Vec<f32>)> {
-    let params = VectorSearchParams::new(prepared.top_k, prepared.nprobe);
+    let params = prepared.params;
     match &prepared.filter_bytes {
         Some(filter) => reader
             .search_with_roaring_filter(&vector_search.vector, params, filter)
@@ -532,7 +570,8 @@ fn search_batch_vindex(
                 let index = indices[0];
                 let (labels, distances) =
                     execute_scalar_search(reader, &vector_searches[index], &prepared)?;
-                let map = collect_results(&labels, &distances, prepared.top_k, metadata.metric);
+                let map =
+                    collect_results(&labels, &distances, prepared.params.top_k, metadata.metric);
                 if !map.is_empty() {
                     results[index] = Some(map);
                 }
@@ -550,7 +589,7 @@ fn search_batch_vindex(
             for &index in indices {
                 queries.extend_from_slice(&vector_searches[index].vector);
             }
-            let params = VectorSearchParams::new(prepared.top_k, prepared.nprobe);
+            let params = prepared.params;
             let (labels, distances) = match &prepared.filter_bytes {
                 Some(filter) => reader
                     .search_batch_with_roaring_filter(&queries, indices.len(), params, filter)
@@ -565,7 +604,7 @@ fn search_batch_vindex(
                         source: Some(Box::new(e)),
                     })?,
             };
-            let expected = indices.len() * prepared.top_k;
+            let expected = indices.len() * prepared.params.top_k;
             if labels.len() != expected || distances.len() != expected {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
@@ -577,12 +616,12 @@ fn search_batch_vindex(
                 });
             }
             for (query_index, &result_index) in indices.iter().enumerate() {
-                let start = query_index * prepared.top_k;
-                let end = start + prepared.top_k;
+                let start = query_index * prepared.params.top_k;
+                let end = start + prepared.params.top_k;
                 let map = collect_results(
                     &labels[start..end],
                     &distances[start..end],
-                    prepared.top_k,
+                    prepared.params.top_k,
                     metadata.metric,
                 );
                 if !map.is_empty() {
@@ -635,12 +674,25 @@ fn native_batch_query_working_set_bytes(
         .saturating_mul(std::mem::size_of::<f32>() * 2);
     let centroid_products = metadata.nlist.saturating_mul(std::mem::size_of::<f32>());
     let probe_results = prepared
-        .nprobe
+        .params
+        .configured_ivf_nprobe()
+        .unwrap_or(0)
         .min(metadata.nlist)
         .saturating_mul(std::mem::size_of::<usize>() + std::mem::size_of::<f32>());
-    let top_k_results = prepared.top_k.saturating_mul(
+    let top_k_results = prepared.params.top_k.saturating_mul(
         std::mem::size_of::<i64>() + std::mem::size_of::<f32>() + std::mem::size_of::<(f32, i64)>(),
     );
+    // ponytail: mirrors vindex 0.3's live frontier; use upstream scratch-byte reporting when exposed.
+    let diskann_candidates = if metadata.index_type == IndexType::DiskAnn {
+        prepared
+            .params
+            .configured_diskann_l_search()
+            .unwrap_or_else(|| prepared.params.top_k.saturating_mul(2).max(100))
+            .max(prepared.params.top_k)
+            .saturating_mul(std::mem::size_of::<(usize, f32)>() + std::mem::size_of::<(i64, f32)>())
+    } else {
+        0
+    };
     let pq_tables = match (metadata.pq_m, metadata.pq_bits) {
         (Some(m), Some(bits)) => 1usize
             .checked_shl(bits as u32)
@@ -654,6 +706,7 @@ fn native_batch_query_working_set_bytes(
         .saturating_add(centroid_products)
         .saturating_add(probe_results)
         .saturating_add(top_k_results)
+        .saturating_add(diskann_candidates)
         .saturating_add(pq_tables)
         .saturating_add(256)
         .max(1)
@@ -740,6 +793,8 @@ mod tests {
     use crate::vindex::range_reader::VindexFileReader;
     use async_trait::async_trait;
     use bytes::Bytes;
+    use paimon_vindex_core::diskann::DiskAnnBuildParams;
+    use paimon_vindex_core::diskann_io::DiskAnnHeader;
     use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
     use paimon_vindex_core::io::{PosWriter, SeekReadCapabilities};
     use std::cell::Cell;
@@ -935,8 +990,7 @@ mod tests {
             diskann: None,
         };
         let base_prepared = PreparedSearch {
-            top_k: 10,
-            nprobe: 16,
+            params: VectorSearchParams::new(10, 16),
             filter_bytes: None,
         };
         let index_parallelism = 32;
@@ -948,7 +1002,7 @@ mod tests {
         assert!(native_batch_chunk_size(&larger_index, &base_prepared, index_parallelism) < base);
 
         let mut larger_top_k = base_prepared.clone();
-        larger_top_k.top_k *= 4;
+        larger_top_k.params.top_k *= 4;
         assert!(native_batch_chunk_size(&base_metadata, &larger_top_k, index_parallelism) < base);
 
         let mut pq_metadata = base_metadata.clone();
@@ -986,8 +1040,7 @@ mod tests {
             diskann: None,
         };
         let prepared = PreparedSearch {
-            top_k: 10,
-            nprobe: 16,
+            params: VectorSearchParams::new(10, 16),
             filter_bytes: Some(vec![0; 128]),
         };
         let chunk_size = native_batch_chunk_size(&metadata, &prepared, 1);
@@ -1066,6 +1119,107 @@ mod tests {
         );
         options.insert(NPROBE_PARAMETER.to_string(), "abc".to_string());
         assert!(int_parameter(&options, NPROBE_PARAMETER, DEFAULT_NPROBE).is_err());
+    }
+
+    #[test]
+    fn prepare_diskann_search_uses_automatic_or_explicit_l_search() {
+        let metadata = VectorIndexMetadata {
+            index_type: paimon_vindex_core::index::IndexType::DiskAnn,
+            dimension: TEST_DIMENSION,
+            nlist: 1,
+            metric: MetricType::L2,
+            total_vectors: 100,
+            pq_m: Some(2),
+            pq_bits: Some(8),
+            rq_bits: None,
+            diskann: None,
+        };
+
+        let automatic = prepare_search(&metadata, &HashMap::new(), &query())
+            .unwrap()
+            .unwrap();
+        let automatic_chunk_size = native_batch_chunk_size(&metadata, &automatic, 1);
+        assert!(automatic_chunk_size > 1);
+        let wide_search = PreparedSearch {
+            params: VectorSearchParams::with_l_search(10, 4096),
+            filter_bytes: None,
+        };
+        assert!(native_batch_chunk_size(&metadata, &wide_search, 1) < automatic_chunk_size);
+        let automatic_params = automatic.params;
+        assert_eq!(
+            automatic_params.search_width,
+            paimon_vindex_core::index::SearchWidth::Auto
+        );
+
+        let explicit = prepare_search(
+            &metadata,
+            &HashMap::from([("diskann.l-search".to_string(), "64".to_string())]),
+            &query(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(automatic != explicit);
+        let explicit_params = explicit.params;
+        assert_eq!(
+            explicit_params.search_width,
+            paimon_vindex_core::index::SearchWidth::DiskAnnLSearch
+        );
+        assert_eq!(explicit_params.width, 64);
+
+        let error = prepare_search(
+            &metadata,
+            &HashMap::from([("ivf.nprobe".to_string(), "4".to_string())]),
+            &query(),
+        )
+        .err()
+        .expect("DiskANN must reject IVF query options");
+        assert!(
+            matches!(error, crate::Error::ConfigInvalid { message } if message.contains("ivf.nprobe"))
+        );
+
+        let mut ivf_metadata = metadata;
+        ivf_metadata.index_type = IndexType::IvfFlat;
+        let error = prepare_search(
+            &ivf_metadata,
+            &HashMap::from([("diskann.l-search".to_string(), "64".to_string())]),
+            &query(),
+        )
+        .err()
+        .expect("IVF must reject DiskANN query options");
+        assert!(
+            matches!(error, crate::Error::ConfigInvalid { message } if message.contains("diskann.l-search"))
+        );
+    }
+
+    #[test]
+    fn diskann_reader_enforces_configured_memory_budget_during_optimization() {
+        let header = DiskAnnHeader::for_layout(
+            8,
+            2,
+            0,
+            2,
+            DiskAnnBuildParams {
+                max_degree: 1,
+                build_search_list_size: 2,
+                ..DiskAnnBuildParams::default()
+            },
+        )
+        .unwrap();
+        let bytes = header.encode().to_vec();
+        let io_meta =
+            GlobalIndexIOMeta::new("budget.index".to_string(), bytes.len() as u64, Vec::new());
+        let options = HashMap::from([(
+            "vindex.reader.memory-budget-bytes".to_string(),
+            "1".to_string(),
+        )]);
+        let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options);
+
+        let error = reader
+            .load(|_| Ok(Cursor::new(bytes)))
+            .expect_err("resident state above the configured budget must fail");
+        let message = error.to_string();
+        assert!(message.contains("resident"), "{message}");
+        assert!(message.contains("budget"), "{message}");
     }
 
     #[test]
