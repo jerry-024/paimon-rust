@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_NPROBE: usize = 16;
 const NPROBE_PARAMETER: &str = "ivf.nprobe";
+// Matches Java's NativeVectorGlobalIndexReader; l_search is intentionally snake_case.
 const L_SEARCH_PARAMETER: &str = "diskann.l_search";
 const READER_MEMORY_BUDGET_PARAMETER: &str = "vindex.reader.memory-budget-bytes";
 const NATIVE_BATCH_PROCESS_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
