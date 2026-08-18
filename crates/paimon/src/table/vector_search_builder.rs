@@ -3472,7 +3472,7 @@ mod tests {
         );
         let query_options = HashMap::from([
             ("diskann.dimension".to_string(), "8".to_string()),
-            ("diskann.l-search".to_string(), "64".to_string()),
+            ("diskann.l_search".to_string(), "64".to_string()),
             (
                 "vindex.reader.memory-budget-bytes".to_string(),
                 "1048576".to_string(),

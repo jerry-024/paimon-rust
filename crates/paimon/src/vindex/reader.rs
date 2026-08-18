@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_NPROBE: usize = 16;
 const NPROBE_PARAMETER: &str = "ivf.nprobe";
-const L_SEARCH_PARAMETER: &str = "diskann.l-search";
+const L_SEARCH_PARAMETER: &str = "diskann.l_search";
 const READER_MEMORY_BUDGET_PARAMETER: &str = "vindex.reader.memory-budget-bytes";
 const NATIVE_BATCH_PROCESS_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
 // Native searches run on dedicated executor threads, so blocking here does not block async I/O.
@@ -448,37 +448,17 @@ fn prepare_search(
         return Ok(None);
     }
     let mut params = match metadata.index_type {
-        IndexType::DiskAnn => {
-            if options.contains_key(NPROBE_PARAMETER) {
-                return Err(crate::Error::ConfigInvalid {
-                    message: format!(
-                        "Option '{}' is not applicable to DiskANN indexes",
-                        NPROBE_PARAMETER
-                    ),
-                });
-            }
-            match options.get(L_SEARCH_PARAMETER) {
-                Some(_) => VectorSearchParams::with_l_search(
-                    top_k,
-                    int_parameter(options, L_SEARCH_PARAMETER, 0)?,
-                ),
-                None => VectorSearchParams::automatic(top_k),
-            }
-        }
-        _ => {
-            if options.contains_key(L_SEARCH_PARAMETER) {
-                return Err(crate::Error::ConfigInvalid {
-                    message: format!(
-                        "Option '{}' is only applicable to DiskANN indexes",
-                        L_SEARCH_PARAMETER
-                    ),
-                });
-            }
-            VectorSearchParams::new(
+        IndexType::DiskAnn => match options.get(L_SEARCH_PARAMETER) {
+            Some(_) => VectorSearchParams::with_l_search(
                 top_k,
-                int_parameter(options, NPROBE_PARAMETER, DEFAULT_NPROBE)?,
-            )
-        }
+                int_parameter(options, L_SEARCH_PARAMETER, 0)?,
+            ),
+            None => VectorSearchParams::automatic(top_k),
+        },
+        _ => VectorSearchParams::new(
+            top_k,
+            int_parameter(options, NPROBE_PARAMETER, DEFAULT_NPROBE)?,
+        ),
     };
 
     let filter_bytes = if let Some(include_ids) = &vector_search.include_row_ids {
@@ -1153,7 +1133,7 @@ mod tests {
 
         let explicit = prepare_search(
             &metadata,
-            &HashMap::from([("diskann.l-search".to_string(), "64".to_string())]),
+            &HashMap::from([("diskann.l_search".to_string(), "64".to_string())]),
             &query(),
         )
         .unwrap()
@@ -1166,29 +1146,29 @@ mod tests {
         );
         assert_eq!(explicit_params.width, 64);
 
-        let error = prepare_search(
-            &metadata,
-            &HashMap::from([("ivf.nprobe".to_string(), "4".to_string())]),
-            &query(),
-        )
-        .err()
-        .expect("DiskANN must reject IVF query options");
-        assert!(
-            matches!(error, crate::Error::ConfigInvalid { message } if message.contains("ivf.nprobe"))
+        let mixed_options = HashMap::from([
+            ("ivf.nprobe".to_string(), "4".to_string()),
+            ("diskann.l_search".to_string(), "64".to_string()),
+        ]);
+        let diskann = prepare_search(&metadata, &mixed_options, &query())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            diskann.params.search_width,
+            paimon_vindex_core::index::SearchWidth::DiskAnnLSearch
         );
+        assert_eq!(diskann.params.width, 64);
 
         let mut ivf_metadata = metadata;
         ivf_metadata.index_type = IndexType::IvfFlat;
-        let error = prepare_search(
-            &ivf_metadata,
-            &HashMap::from([("diskann.l-search".to_string(), "64".to_string())]),
-            &query(),
-        )
-        .err()
-        .expect("IVF must reject DiskANN query options");
-        assert!(
-            matches!(error, crate::Error::ConfigInvalid { message } if message.contains("diskann.l-search"))
+        let ivf = prepare_search(&ivf_metadata, &mixed_options, &query())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ivf.params.search_width,
+            paimon_vindex_core::index::SearchWidth::IvfNProbe
         );
+        assert_eq!(ivf.params.width, 4);
     }
 
     #[test]

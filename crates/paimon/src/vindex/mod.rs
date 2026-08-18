@@ -39,7 +39,6 @@ const DEFAULT_METRIC: &str = "inner_product";
 const DEFAULT_NLIST: &str = "256";
 const DEFAULT_PQ_M: &str = "16";
 const DEFAULT_PQ_USE_OPQ: &str = "false";
-const DEFAULT_RQ_BITS: &str = "4";
 const DEFAULT_TRAIN_SAMPLE_RATIO: f64 = 1.0;
 const VECTOR_SEARCH_TIMING_ENV: &str = "PAIMON_LOG_VECTOR_SEARCH_TIMING";
 const DISKANN_OPTION_KEYS: &[(&str, &str)] = &[
@@ -193,18 +192,18 @@ impl VindexVectorIndexOptions {
             );
         }
         if index_type == IVF_RQ_IDENTIFIER {
-            native_options.insert(
-                "rq.bits".to_string(),
-                option_value(
+            for key in ["rq.bits", "max-bytes-per-vector"] {
+                if let Some(value) = optional_value(
                     table_options,
                     user_options,
                     field.name(),
                     index_type,
-                    "rq.bits",
-                    "rq.bits",
-                    DEFAULT_RQ_BITS,
-                ),
-            );
+                    key,
+                    key,
+                ) {
+                    native_options.insert(key.to_string(), value);
+                }
+            }
         }
         if index_type == DISKANN_IDENTIFIER {
             for &(native_key, paimon_suffix) in DISKANN_OPTION_KEYS {
@@ -314,6 +313,9 @@ fn is_allowed_native_key(key: &str, index_type: &str) -> bool {
         "nlist" => index_type != DISKANN_IDENTIFIER,
         "use-opq" => index_type == IVF_PQ_IDENTIFIER,
         "rq.bits" => index_type == IVF_RQ_IDENTIFIER,
+        "max-bytes-per-vector" => {
+            matches!(index_type, IVF_RQ_IDENTIFIER | DISKANN_IDENTIFIER)
+        }
         "pq.m" if index_type == IVF_PQ_IDENTIFIER => true,
         _ => {
             index_type == DISKANN_IDENTIFIER
@@ -327,9 +329,13 @@ fn is_allowed_native_key(key: &str, index_type: &str) -> bool {
 fn is_allowed_paimon_suffix(suffix: &str, index_type: &str) -> bool {
     match suffix {
         "dimension" | "distance.metric" => true,
-        "nlist" | "train.sample-ratio" => index_type != DISKANN_IDENTIFIER,
+        "nlist" => index_type != DISKANN_IDENTIFIER,
+        "train.sample-ratio" => true,
         "pq.use-opq" => index_type == IVF_PQ_IDENTIFIER,
         "rq.bits" => index_type == IVF_RQ_IDENTIFIER,
+        "max-bytes-per-vector" => {
+            matches!(index_type, IVF_RQ_IDENTIFIER | DISKANN_IDENTIFIER)
+        }
         "pq.m" if index_type == IVF_PQ_IDENTIFIER => true,
         _ => {
             index_type == DISKANN_IDENTIFIER
@@ -581,6 +587,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(defaults.config.resolved().rq_bits, Some(4));
+        assert!(!defaults.native_options.contains_key("rq.bits"));
+
+        let capacity_goal = HashMap::from([
+            ("dimension".to_string(), "100".to_string()),
+            ("nlist".to_string(), "16".to_string()),
+            ("ivf-rq.max-bytes-per-vector".to_string(), "88".to_string()),
+        ]);
+        let inferred = VindexVectorIndexOptions::new(
+            &HashMap::new(),
+            &capacity_goal,
+            IVF_RQ_IDENTIFIER,
+            &array_float_field(),
+        )
+        .unwrap();
+        assert_eq!(inferred.config.resolved().rq_bits, Some(3));
+        assert_eq!(
+            inferred
+                .native_options
+                .get("max-bytes-per-vector")
+                .map(String::as_str),
+            Some("88")
+        );
+        assert!(!inferred.native_options.contains_key("rq.bits"));
 
         let invalid = HashMap::from([("ivf-rq.rq.bits".to_string(), "9".to_string())]);
         let error = VindexVectorIndexOptions::new(
@@ -791,6 +820,15 @@ mod tests {
         .unwrap();
         assert_eq!(options.train_sample_ratio, 1.0);
         assert!(!options.native_options.contains_key("train.sample-ratio"));
+
+        let diskann = VindexVectorIndexOptions::new(
+            &HashMap::new(),
+            &HashMap::from([("diskann.train.sample-ratio".to_string(), "0.5".to_string())]),
+            DISKANN_IDENTIFIER,
+            &array_float_field(),
+        )
+        .unwrap();
+        assert_eq!(diskann.train_sample_ratio, 0.5);
     }
 
     #[test]
