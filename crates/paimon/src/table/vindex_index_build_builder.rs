@@ -42,7 +42,6 @@ use tokio_util::io::SyncIoBridge;
 
 const INDEX_DIR: &str = "index";
 const VECTOR_BUFFER_BYTES: usize = 8 * 1024 * 1024;
-const INDEX_ADD_BATCH_ROWS: usize = 32 * 1024;
 const VECTOR_INDEX_BUILD_TIMING_ENV: &str = "PAIMON_LOG_VECTOR_INDEX_BUILD_TIMING";
 
 fn vector_index_build_timing_enabled() -> bool {
@@ -533,14 +532,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 if let Some(start) = reread_start {
                     raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
                 }
-                let batch_rows = INDEX_ADD_BATCH_ROWS.min(row_count_usize);
+                let batch_rows = training_buffer_rows.min(row_count_usize);
                 let batch_bytes = checked_std_vector_bytes(batch_rows, dimension_usize)?;
                 let mut buffer = MutableBuffer::new(batch_bytes);
                 let mut ids = Vec::with_capacity(batch_rows);
                 let mut rows_added = 0usize;
                 while rows_added < row_count_usize {
                     let rows = batch_rows.min(row_count_usize - rows_added);
-                    let batch_end = checked_index_add_batch_end(rows_added, rows)?;
                     buffer.resize(checked_std_vector_bytes(rows, dimension_usize)?, 0);
                     let reread_start = timing_enabled.then(Instant::now);
                     raw_file.read_exact(buffer.as_slice_mut())?;
@@ -548,7 +546,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                         raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
                     }
                     ids.clear();
-                    for row in rows_added..batch_end {
+                    for row in rows_added..rows_added + rows {
                         ids.push(i64::try_from(row).map_err(|_| {
                             std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -561,7 +559,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     if let Some(start) = add_start {
                         index_add = index_add.saturating_add(start.elapsed());
                     }
-                    rows_added = batch_end;
+                    rows_added += rows;
                 }
                 let mut trailing = [0u8; 1];
                 let reread_start = timing_enabled.then(Instant::now);
@@ -1165,15 +1163,6 @@ fn checked_std_vector_bytes(row_count: usize, dimension: usize) -> std::io::Resu
         })
 }
 
-fn checked_index_add_batch_end(start: usize, rows: usize) -> std::io::Result<usize> {
-    start.checked_add(rows).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "vindex index-add batch end overflows usize",
-        )
-    })
-}
-
 fn checked_training_vector_count(row_count: usize, ratio: f64) -> Result<usize> {
     if row_count == 0 || !(ratio > 0.0 && ratio <= 1.0) {
         return Err(Error::DataInvalid {
@@ -1535,32 +1524,6 @@ mod tests {
         );
         assert!(checked_vector_bytes(usize::MAX, 2).is_err());
         assert!(checked_training_sample_index(usize::MAX, usize::MAX, 1).is_err());
-    }
-
-    #[test]
-    fn test_index_add_batch_ranges() {
-        let ranges = |row_count| {
-            let mut result = Vec::new();
-            let mut start = 0;
-            while start < row_count {
-                let rows = INDEX_ADD_BATCH_ROWS.min(row_count - start);
-                let end = checked_index_add_batch_end(start, rows).unwrap();
-                result.push(start..end);
-                start = end;
-            }
-            result
-        };
-
-        assert_eq!(ranges(10), vec![0..10]);
-        assert_eq!(ranges(INDEX_ADD_BATCH_ROWS), vec![0..INDEX_ADD_BATCH_ROWS]);
-        assert_eq!(
-            ranges(INDEX_ADD_BATCH_ROWS + 7),
-            vec![
-                0..INDEX_ADD_BATCH_ROWS,
-                INDEX_ADD_BATCH_ROWS..INDEX_ADD_BATCH_ROWS + 7
-            ]
-        );
-        assert!(checked_index_add_batch_end(usize::MAX, 1).is_err());
     }
 
     fn test_table_with_io(file_io: FileIO, table_path: &str, schema: Schema) -> Table {

@@ -924,7 +924,11 @@ fn merge_row_selection(
     }
 
     if !has_dv {
-        return row_ranges.map(|r| r.to_vec());
+        return match row_ranges {
+            Some(ranges) if ranges_cover_all_rows(ranges, row_count) => None,
+            Some(ranges) => Some(ranges.to_vec()),
+            None => None,
+        };
     }
 
     let dv_ranges = dv_to_non_deleted_ranges(dv.unwrap(), row_count);
@@ -933,6 +937,20 @@ fn merge_row_selection(
         Some(ranges) => Some(intersect_sorted_ranges(&dv_ranges, ranges)),
         None => Some(dv_ranges),
     }
+}
+
+fn ranges_cover_all_rows(ranges: &[RowRange], row_count: i64) -> bool {
+    if row_count <= 0 || ranges.is_empty() || ranges[0].from() > 0 {
+        return false;
+    }
+    let mut covered_to = ranges[0].to();
+    for range in &ranges[1..] {
+        if range.from() > covered_to.saturating_add(1) {
+            return false;
+        }
+        covered_to = covered_to.max(range.to());
+    }
+    covered_to >= row_count - 1
 }
 
 /// Convert a DeletionVector into sorted non-deleted inclusive RowRanges.
@@ -1471,6 +1489,30 @@ mod tests {
                 Duration::from_millis(16),
                 Duration::from_millis(20),
             )
+        );
+    }
+
+    #[test]
+    fn merge_row_selection_skips_only_unfiltered_full_coverage() {
+        let full = [RowRange::new(0, 9)];
+        let joined = [RowRange::new(0, 3), RowRange::new(4, 9)];
+        let partial = [RowRange::new(1, 9)];
+        let empty = [];
+
+        assert_eq!(merge_row_selection(10, None, Some(&full)), None);
+        assert_eq!(merge_row_selection(10, None, Some(&joined)), None);
+        assert_eq!(
+            merge_row_selection(10, None, Some(&partial)),
+            Some(partial.to_vec())
+        );
+        assert_eq!(merge_row_selection(10, None, Some(&empty)), Some(vec![]));
+
+        let mut deleted = RoaringBitmap::new();
+        deleted.insert(3);
+        let dv = DeletionVector::from_bitmap(deleted);
+        assert_eq!(
+            merge_row_selection(10, Some(&dv), Some(&full)),
+            Some(vec![RowRange::new(0, 2), RowRange::new(4, 9)])
         );
     }
 
