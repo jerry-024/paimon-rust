@@ -57,6 +57,9 @@ struct VectorIndexBuildTiming {
     source_batch_wait: Duration,
     oss_read: Duration,
     parquet_decode: Duration,
+    file_schema_open: Duration,
+    first_batch_wait: Duration,
+    remaining_batch_wait: Duration,
     parquet_row_group_count: u64,
     parquet_projected_bytes_min: u64,
     parquet_projected_bytes_max: u64,
@@ -90,7 +93,7 @@ impl VectorIndexBuildTiming {
             .saturating_add(commit);
         let unattributed = total.saturating_sub(accounted);
         eprintln!(
-            "event=paimon_vector_index_build index_type={} file={} rows={} training_rows_seen={} training_rows_retained={} batch_count={} raw_temp_bytes={} index_bytes={} source_batch_wait_ms={:.3} oss_read_ms={:.3} parquet_decode_ms={:.3} parquet_row_group_count={} parquet_projected_bytes_min={} parquet_projected_bytes_max={} parquet_projected_bytes_total={} parquet_peak_inflight_row_groups={} raw_temp_write_ms={:.3} train_finish_ms={:.3} raw_temp_reread_ms={:.3} index_add_ms={:.3} serialize_upload_ms={:.3} commit_ms={:.3} sample_read_ms=0.000 full_scan_add_ms=0.000 pipeline_blocked_ms=0.000 producer_blocked_ms=0.000 consumer_add_ms=0.000 data_file_count={} data_file_read_concurrency=1 peak_ready_batches=0 total_ms={:.3} unattributed_ms={:.3}",
+            "event=paimon_vector_index_build index_type={} file={} rows={} training_rows_seen={} training_rows_retained={} batch_count={} raw_temp_bytes={} index_bytes={} source_batch_wait_ms={:.3} oss_read_ms={:.3} parquet_decode_ms={:.3} file_schema_open_ms={:.3} first_batch_wait_ms={:.3} remaining_batch_wait_ms={:.3} parquet_row_group_count={} parquet_projected_bytes_min={} parquet_projected_bytes_max={} parquet_projected_bytes_total={} parquet_peak_inflight_row_groups={} raw_temp_write_ms={:.3} train_finish_ms={:.3} raw_temp_reread_ms={:.3} index_add_ms={:.3} serialize_upload_ms={:.3} commit_ms={:.3} sample_read_ms=0.000 full_scan_add_ms=0.000 pipeline_blocked_ms=0.000 producer_blocked_ms=0.000 consumer_add_ms=0.000 data_file_count={} data_file_read_concurrency=1 peak_ready_batches=0 total_ms={:.3} unattributed_ms={:.3}",
             index_type,
             self.file_name,
             self.rows,
@@ -102,6 +105,9 @@ impl VectorIndexBuildTiming {
             self.source_batch_wait.as_secs_f64() * 1000.0,
             self.oss_read.as_secs_f64() * 1000.0,
             self.parquet_decode.as_secs_f64() * 1000.0,
+            self.file_schema_open.as_secs_f64() * 1000.0,
+            self.first_batch_wait.as_secs_f64() * 1000.0,
+            self.remaining_batch_wait.as_secs_f64() * 1000.0,
             self.parquet_row_group_count,
             self.parquet_projected_bytes_min,
             self.parquet_projected_bytes_max,
@@ -656,6 +662,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             .map_or((Duration::ZERO, Duration::ZERO), |timing| {
                 (timing.file_read(), timing.parquet_decode())
             });
+        let (file_schema_open, first_batch_wait, remaining_batch_wait) = read_timing
+            .as_ref()
+            .map_or((Duration::ZERO, Duration::ZERO, Duration::ZERO), |timing| {
+                timing.file_waits()
+            });
         let parquet_diagnostics = parquet_read_budget
             .as_ref()
             .map_or_else(Default::default, |budget| budget.diagnostics());
@@ -664,6 +675,9 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             source_batch_wait,
             oss_read,
             parquet_decode,
+            file_schema_open,
+            first_batch_wait,
+            remaining_batch_wait,
             parquet_row_group_count: parquet_diagnostics.row_group_count,
             parquet_projected_bytes_min: parquet_diagnostics.projected_bytes_min,
             parquet_projected_bytes_max: parquet_diagnostics.projected_bytes_max,

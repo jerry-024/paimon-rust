@@ -42,6 +42,9 @@ use std::time::{Duration, Instant};
 pub(crate) struct DataFileReadTiming {
     file_read_nanos: AtomicU64,
     parquet_decode_nanos: AtomicU64,
+    file_schema_open_nanos: AtomicU64,
+    first_batch_wait_nanos: AtomicU64,
+    remaining_batch_wait_nanos: AtomicU64,
 }
 
 impl DataFileReadTiming {
@@ -55,12 +58,34 @@ impl DataFileReadTiming {
             .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
     }
 
+    fn add_file_schema_open(&self, duration: Duration) {
+        self.file_schema_open_nanos
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_batch_wait(&self, duration: Duration, first: bool) {
+        let target = if first {
+            &self.first_batch_wait_nanos
+        } else {
+            &self.remaining_batch_wait_nanos
+        };
+        target.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
     pub(crate) fn file_read(&self) -> Duration {
         Duration::from_nanos(self.file_read_nanos.load(Ordering::Relaxed))
     }
 
     pub(crate) fn parquet_decode(&self) -> Duration {
         Duration::from_nanos(self.parquet_decode_nanos.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn file_waits(&self) -> (Duration, Duration, Duration) {
+        (
+            Duration::from_nanos(self.file_schema_open_nanos.load(Ordering::Relaxed)),
+            Duration::from_nanos(self.first_batch_wait_nanos.load(Ordering::Relaxed)),
+            Duration::from_nanos(self.remaining_batch_wait_nanos.load(Ordering::Relaxed)),
+        )
     }
 }
 
@@ -225,7 +250,13 @@ impl DataFileReader {
                     );
 
                     // Load data file's schema if it differs from the table schema.
+                    let schema_start = reader.read_timing.as_ref().map(|_| Instant::now());
                     let data_fields = reader.derive_data_fields(&file_meta).await?;
+                    if let (Some(timing), Some(start)) =
+                        (reader.read_timing.as_ref(), schema_start)
+                    {
+                        timing.add_file_schema_open(start.elapsed());
+                    }
 
                     let mut stream = reader.read_single_file_stream(
                         &split,
@@ -388,6 +419,7 @@ impl DataFileReader {
         };
 
         Ok(try_stream! {
+            let schema_open_start = read_timing.as_ref().map(|_| Instant::now());
             let path_to_read = split.data_file_path(&file_meta);
             let format_reader = create_format_reader_with_budget(
                 &path_to_read,
@@ -435,8 +467,13 @@ impl DataFileReader {
                 batch_size,
                 row_selection,
             ).await?;
+            if let (Some(timing), Some(start)) = (read_timing.as_ref(), schema_open_start) {
+                timing.add_file_schema_open(start.elapsed());
+            }
+            let mut first_batch = true;
 
             loop {
+                let batch_wait_start = read_timing.as_ref().map(|_| Instant::now());
                 let batch = if is_parquet {
                     if let Some(timing) = read_timing.as_ref() {
                         std::future::poll_fn(|cx| {
@@ -452,7 +489,11 @@ impl DataFileReader {
                 } else {
                     batch_stream.next().await
                 };
+                if let (Some(timing), Some(start)) = (read_timing.as_ref(), batch_wait_start) {
+                    timing.add_batch_wait(start.elapsed(), first_batch);
+                }
                 let Some(batch) = batch else { break };
+                first_batch = false;
                 let batch = batch?;
                 let num_rows = batch.num_rows();
                 let batch_schema = batch.schema();
@@ -1412,6 +1453,26 @@ mod tests {
     use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use roaring::RoaringBitmap;
     use std::io;
+
+    #[test]
+    fn test_data_file_read_timing_aggregates_file_waits() {
+        let timing = DataFileReadTiming::default();
+        timing.add_file_schema_open(Duration::from_millis(2));
+        timing.add_batch_wait(Duration::from_millis(5), true);
+        timing.add_batch_wait(Duration::from_millis(7), false);
+        timing.add_file_schema_open(Duration::from_millis(3));
+        timing.add_batch_wait(Duration::from_millis(11), true);
+        timing.add_batch_wait(Duration::from_millis(13), false);
+
+        assert_eq!(
+            timing.file_waits(),
+            (
+                Duration::from_millis(5),
+                Duration::from_millis(16),
+                Duration::from_millis(20),
+            )
+        );
+    }
 
     #[test]
     fn test_accessors_expose_read_type_and_row_filtering_predicate() {
