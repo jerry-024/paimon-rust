@@ -42,6 +42,9 @@ use tokio_util::io::SyncIoBridge;
 
 const INDEX_DIR: &str = "index";
 const VECTOR_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+/// In-flight multipart chunks while uploading the serialized index
+/// (4 x 8 MiB = 32 MiB of upload buffer).
+const INDEX_UPLOAD_CONCURRENCY: usize = 4;
 const VECTOR_INDEX_BUILD_TIMING_ENV: &str = "PAIMON_LOG_VECTOR_INDEX_BUILD_TIMING";
 
 fn vector_index_build_timing_enabled() -> bool {
@@ -604,11 +607,14 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             file_name
         );
         let write_result = async {
+            // Overlap index serialization with multipart uploads: the index is
+            // ~2 GB produced sequentially, and the default writer uploads its
+            // 8 MiB parts one at a time (one round trip per part).
             let async_writer = self
                 .table
                 .file_io()
                 .new_output(&index_path)?
-                .async_writer()
+                .async_writer_with_concurrency(INDEX_UPLOAD_CONCURRENCY)
                 .await?;
             let mut output = SyncIoBridge::new(async_writer);
             tokio::task::spawn_blocking(move || -> std::io::Result<()> {

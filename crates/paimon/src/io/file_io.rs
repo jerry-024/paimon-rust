@@ -768,10 +768,23 @@ impl OutputFile {
 
     /// Get an async streaming writer for format-level writes (e.g. parquet).
     pub(crate) async fn async_writer(&self) -> crate::Result<Box<dyn AsyncFileWrite>> {
+        self.async_writer_with_concurrency(1).await
+    }
+
+    /// Like [`Self::async_writer`], but uploads up to `concurrent` multipart
+    /// chunks in flight. The default writer uploads its 8 MiB parts strictly
+    /// one at a time, so a large sequentially-produced file (e.g. a vector
+    /// index) pays one round trip per part; a small concurrency overlaps the
+    /// producer with the uploads at a cost of `concurrent * 8 MiB` of buffer.
+    pub(crate) async fn async_writer_with_concurrency(
+        &self,
+        concurrent: usize,
+    ) -> crate::Result<Box<dyn AsyncFileWrite>> {
         let (op, relative_path, cache_path) = self.resolve().await?;
         let writer: Box<dyn AsyncFileWrite> = Box::new(
             op.writer_with(&relative_path)
                 .chunk(8 * 1024 * 1024)
+                .concurrent(concurrent.max(1))
                 .await?
                 .into_futures_async_write()
                 .compat_write(),
