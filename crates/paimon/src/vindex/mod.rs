@@ -190,6 +190,16 @@ impl VindexVectorIndexOptions {
                     DEFAULT_PQ_USE_OPQ,
                 ),
             );
+            if let Some(value) = optional_value(
+                table_options,
+                user_options,
+                field.name(),
+                index_type,
+                "approximate-assignment",
+                "approximate-assignment",
+            ) {
+                native_options.insert("approximate-assignment".to_string(), value);
+            }
         }
         if index_type == IVF_RQ_IDENTIFIER {
             for key in ["rq.bits", "max-bytes-per-vector"] {
@@ -312,6 +322,7 @@ fn is_allowed_native_key(key: &str, index_type: &str) -> bool {
         "dimension" | "metric" => true,
         "nlist" => index_type != DISKANN_IDENTIFIER,
         "use-opq" => index_type == IVF_PQ_IDENTIFIER,
+        "approximate-assignment" => index_type == IVF_PQ_IDENTIFIER,
         "rq.bits" => index_type == IVF_RQ_IDENTIFIER,
         "max-bytes-per-vector" => {
             matches!(index_type, IVF_RQ_IDENTIFIER | DISKANN_IDENTIFIER)
@@ -332,6 +343,7 @@ fn is_allowed_paimon_suffix(suffix: &str, index_type: &str) -> bool {
         "nlist" => index_type != DISKANN_IDENTIFIER,
         "train.sample-ratio" => true,
         "pq.use-opq" => index_type == IVF_PQ_IDENTIFIER,
+        "approximate-assignment" => index_type == IVF_PQ_IDENTIFIER,
         "rq.bits" => index_type == IVF_RQ_IDENTIFIER,
         "max-bytes-per-vector" => {
             matches!(index_type, IVF_RQ_IDENTIFIER | DISKANN_IDENTIFIER)
@@ -528,6 +540,10 @@ mod tests {
             ("ivf-pq.distance.metric".to_string(), "cosine".to_string()),
             ("ivf-pq.pq.m".to_string(), "2".to_string()),
             ("ivf-pq.pq.use-opq".to_string(), "true".to_string()),
+            (
+                "ivf-pq.approximate-assignment".to_string(),
+                "true".to_string(),
+            ),
         ]);
 
         let options = VindexVectorIndexOptions::new(
@@ -553,6 +569,13 @@ mod tests {
         );
         assert_eq!(
             options.native_options.get("use-opq").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            options
+                .native_options
+                .get("approximate-assignment")
+                .map(String::as_str),
             Some("true")
         );
     }
