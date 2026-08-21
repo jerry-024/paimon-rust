@@ -31,6 +31,7 @@ pub struct ParquetReadBudget {
     row_groups: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     byte_permits: u32,
+    oversized_warning_logged: AtomicBool,
     diagnostics: Arc<ParquetReadDiagnostics>,
 }
 
@@ -96,6 +97,7 @@ impl ParquetReadBudget {
             row_groups: Arc::new(Semaphore::new(parallelism)),
             bytes: Arc::new(Semaphore::new(byte_permits as usize)),
             byte_permits,
+            oversized_warning_logged: AtomicBool::new(false),
             diagnostics: Arc::new(ParquetReadDiagnostics::default()),
         })
     }
@@ -170,6 +172,17 @@ impl ParquetReadBudget {
             .max(1)
             .div_ceil(BYTE_PERMIT_UNIT)
             .min(u64::from(self.byte_permits)) as u32;
+        if projected_uncompressed_bytes > u64::from(self.byte_permits) * BYTE_PERMIT_UNIT
+            && !self.oversized_warning_logged.swap(true, Ordering::Relaxed)
+        {
+            log::warn!(
+                "Parquet row group projected size ({projected_uncompressed_bytes} bytes) exceeds \
+                 read.parquet.row-group.max-inflight-bytes ({} bytes); it will consume the entire \
+                 byte budget and may reduce row-group read parallelism; increase the option if \
+                 memory allows",
+                u64::from(self.byte_permits) * BYTE_PERMIT_UNIT
+            );
+        }
         let bytes = Arc::clone(&self.bytes)
             .acquire_many_owned(requested)
             .await
@@ -282,6 +295,7 @@ mod tests {
     async fn oversized_row_group_consumes_the_budget() {
         let budget = Arc::new(ParquetReadBudget::new(8, 8 * BYTE_PERMIT_UNIT).unwrap());
         let first = budget.acquire(100 * BYTE_PERMIT_UNIT).await.unwrap();
+        assert!(budget.oversized_warning_logged.load(Ordering::Relaxed));
         assert!(
             tokio::time::timeout(Duration::from_millis(20), budget.acquire(1))
                 .await
