@@ -79,7 +79,6 @@ impl DataFileReadTiming {
     pub(crate) fn parquet_decode(&self) -> Duration {
         Duration::from_nanos(self.parquet_decode_nanos.load(Ordering::Relaxed))
     }
-
     pub(crate) fn file_waits(&self) -> (Duration, Duration, Duration) {
         (
             Duration::from_nanos(self.file_schema_open_nanos.load(Ordering::Relaxed)),
