@@ -23,6 +23,16 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 const BYTE_PERMIT_UNIT: u64 = 1024 * 1024;
 const DEFAULT_PARALLELISM: usize = 8;
 const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 256 * 1024 * 1024;
+/// A single row group's byte accounting is capped to the budget divided by
+/// this share, so one oversized row group (e.g. a ~294 MiB projected wide
+/// vector column under the 256 MiB default budget) cannot consume every
+/// byte permit and silently serialize the scan. This makes the byte budget
+/// a fair-admission mechanism for large row groups rather than a strict
+/// projected-byte ceiling: up to `min(parallelism, MAX_BUDGET_SHARES)` such
+/// row groups may be in flight, each accounted at `budget / shares` even
+/// though its projected size is larger. Capped at 4 shares until wider RSS
+/// measurements justify the full parallelism.
+const MAX_BUDGET_SHARES: usize = 4;
 
 /// Shared resource budget for concurrent Parquet row-group reads.
 #[derive(Debug)]
@@ -166,9 +176,17 @@ impl ParquetReadBudget {
                 message: "Parquet row-group read budget was closed".to_string(),
                 source: Some(Box::new(error)),
             })?;
+        // Cap a single row group's accounting to a fair share of the budget
+        // (see MAX_BUDGET_SHARES): an oversized row group must not take every
+        // permit and serialize the scan. `parallelism >= 1` is validated at
+        // construction, and `max(1)` keeps tiny budgets sound — the semaphore
+        // still bounds total in-flight permits.
+        let shares = self.parallelism.min(MAX_BUDGET_SHARES) as u64;
+        let share_cap = u64::from(self.byte_permits).div_ceil(shares).max(1);
         let requested = projected_uncompressed_bytes
             .max(1)
             .div_ceil(BYTE_PERMIT_UNIT)
+            .min(share_cap)
             .min(u64::from(self.byte_permits)) as u32;
         let bytes = Arc::clone(&self.bytes)
             .acquire_many_owned(requested)
@@ -276,5 +294,98 @@ mod tests {
             ParquetReadBudget::new(Semaphore::MAX_PERMITS.saturating_add(1), BYTE_PERMIT_UNIT)
                 .is_err()
         );
+    }
+
+    /// A row group larger than the whole budget must not serialize the scan:
+    /// its accounting is capped to budget / min(parallelism, MAX_BUDGET_SHARES),
+    /// so min(parallelism, MAX_BUDGET_SHARES) oversized row groups run
+    /// concurrently. This is the wide-vector-column case (a ~294 MiB projected
+    /// row group under the 256 MiB default budget).
+    #[tokio::test]
+    async fn oversized_row_groups_share_the_budget() {
+        // parallelism 8 > MAX_BUDGET_SHARES: shares = 4.
+        let budget = Arc::new(ParquetReadBudget::new(8, 8 * BYTE_PERMIT_UNIT).unwrap());
+        budget.enable_diagnostics();
+        let oversized = 100 * BYTE_PERMIT_UNIT; // far above the whole budget
+
+        // 4 oversized acquisitions must all succeed (each accounted at 2 permits).
+        let mut permits = Vec::new();
+        for _ in 0..MAX_BUDGET_SHARES {
+            permits.push(
+                tokio::time::timeout(Duration::from_secs(1), budget.acquire(oversized))
+                    .await
+                    .expect("an oversized row group must only take a fair share")
+                    .unwrap(),
+            );
+        }
+        assert_eq!(budget.diagnostics().peak_inflight, MAX_BUDGET_SHARES);
+
+        // The 5th oversized request exhausts the byte semaphore and must wait.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), budget.acquire(oversized))
+                .await
+                .is_err(),
+            "the byte budget still bounds total in-flight accounting"
+        );
+
+        drop(permits);
+        tokio::time::timeout(Duration::from_secs(1), budget.acquire(oversized))
+            .await
+            .expect("released shares must become available again")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_divisible_budget_does_not_exceed_max_shares() {
+        let budget = Arc::new(ParquetReadBudget::new(8, 10 * BYTE_PERMIT_UNIT).unwrap());
+        let oversized = 100 * BYTE_PERMIT_UNIT;
+
+        // ceil(10 / 4) = 3 permits, so only 3 oversized reads fit. Rounding
+        // down to 2 would incorrectly admit 5 reads and exceed the cap.
+        let permits = futures::future::try_join_all((0..3).map(|_| budget.acquire(oversized)))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), budget.acquire(oversized))
+                .await
+                .is_err()
+        );
+        drop(permits);
+    }
+
+    /// Row groups at or below budget / shares keep their exact accounting —
+    /// the share cap must not change behavior for ordinary layouts.
+    #[tokio::test]
+    async fn small_row_groups_keep_exact_accounting() {
+        let budget = Arc::new(ParquetReadBudget::new(4, 4 * BYTE_PERMIT_UNIT).unwrap());
+        // share_cap = 4 / min(4,4) = 1 permit; a 1 MiB row group requests
+        // exactly 1 permit, so 4 fit and the 5th blocks — identical to the
+        // pre-cap behavior for small row groups.
+        let mut permits = Vec::new();
+        for _ in 0..4 {
+            permits.push(budget.acquire(BYTE_PERMIT_UNIT).await.unwrap());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), budget.acquire(BYTE_PERMIT_UNIT))
+                .await
+                .is_err()
+        );
+    }
+
+    /// Tiny budgets stay sound: the cap never rounds a request down to zero
+    /// permits, and a budget smaller than the share divisor still admits one
+    /// row group at a time.
+    #[tokio::test]
+    async fn tiny_budget_still_admits_one_at_a_time() {
+        let budget = Arc::new(ParquetReadBudget::new(8, BYTE_PERMIT_UNIT).unwrap());
+        let first = budget.acquire(100 * BYTE_PERMIT_UNIT).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), budget.acquire(1))
+                .await
+                .is_err(),
+            "a single-permit budget admits exactly one read"
+        );
+        drop(first);
+        budget.acquire(1).await.unwrap();
     }
 }
