@@ -59,7 +59,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ("metric".to_string(), "cosine".to_string()),
         ("nlist".to_string(), "4096".to_string()),
         ("pq.m".to_string(), "192".to_string()),
-        ("approximate-assignment".to_string(), "true".to_string()),
     ]);
     let started = Instant::now();
     let built_shards = table
