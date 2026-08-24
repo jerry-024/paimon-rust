@@ -31,6 +31,7 @@ pub struct ParquetReadBudget {
     row_groups: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     byte_permits: u32,
+    max_inflight_bytes: u64,
     oversized_warning_logged: AtomicBool,
     diagnostics: Arc<ParquetReadDiagnostics>,
 }
@@ -97,6 +98,7 @@ impl ParquetReadBudget {
             row_groups: Arc::new(Semaphore::new(parallelism)),
             bytes: Arc::new(Semaphore::new(byte_permits as usize)),
             byte_permits,
+            max_inflight_bytes,
             oversized_warning_logged: AtomicBool::new(false),
             diagnostics: Arc::new(ParquetReadDiagnostics::default()),
         })
@@ -172,7 +174,7 @@ impl ParquetReadBudget {
             .max(1)
             .div_ceil(BYTE_PERMIT_UNIT)
             .min(u64::from(self.byte_permits)) as u32;
-        if projected_uncompressed_bytes > u64::from(self.byte_permits) * BYTE_PERMIT_UNIT
+        if projected_uncompressed_bytes > self.max_inflight_bytes
             && !self.oversized_warning_logged.swap(true, Ordering::Relaxed)
         {
             log::warn!(
@@ -180,7 +182,7 @@ impl ParquetReadBudget {
                  read.parquet.row-group.max-inflight-bytes ({} bytes); it will consume the entire \
                  byte budget and may reduce row-group read parallelism; increase the option if \
                  memory allows",
-                u64::from(self.byte_permits) * BYTE_PERMIT_UNIT
+                self.max_inflight_bytes
             );
         }
         let bytes = Arc::clone(&self.bytes)
@@ -293,9 +295,10 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_row_group_consumes_the_budget() {
-        let budget = Arc::new(ParquetReadBudget::new(8, 8 * BYTE_PERMIT_UNIT).unwrap());
-        let first = budget.acquire(100 * BYTE_PERMIT_UNIT).await.unwrap();
-        assert!(budget.oversized_warning_logged.load(Ordering::Relaxed));
+        let max_inflight_bytes = 8 * BYTE_PERMIT_UNIT + 1;
+        let budget = Arc::new(ParquetReadBudget::new(8, max_inflight_bytes).unwrap());
+        let first = budget.acquire(max_inflight_bytes).await.unwrap();
+        assert!(!budget.oversized_warning_logged.load(Ordering::Relaxed));
         assert!(
             tokio::time::timeout(Duration::from_millis(20), budget.acquire(1))
                 .await
@@ -303,6 +306,9 @@ mod tests {
             "an oversized row group must consume the whole byte budget"
         );
         drop(first);
+        let oversized = budget.acquire(max_inflight_bytes + 1).await.unwrap();
+        assert!(budget.oversized_warning_logged.load(Ordering::Relaxed));
+        drop(oversized);
         budget.acquire(1).await.unwrap();
     }
 
