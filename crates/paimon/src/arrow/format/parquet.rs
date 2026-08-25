@@ -500,7 +500,9 @@ impl FormatFileReader for ParquetFormatReader {
                     .min(batch_stream_builder.metadata().num_row_groups())
             })
             .unwrap_or(1);
-        let projected_bytes = read_budget
+        let projected_bytes = self
+            .read_budget
+            .as_ref()
             .filter(|budget| row_group_parallelism > 1 || budget.diagnostics_enabled())
             .map(|budget| {
                 let projected_bytes = batch_stream_builder
@@ -2890,6 +2892,35 @@ mod tests {
             observed, 2,
             "two readers must share the same row-group budget"
         );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_diagnostics_include_reads_with_row_selection() {
+        let data = write_multi_row_group_parquet(32, 64, EnabledStatistics::Chunk).await;
+        let budget = Arc::new(ParquetReadBudget::new(8, 256 * 1024 * 1024).unwrap());
+        budget.enable_diagnostics();
+        let file_size = data.len() as u64;
+        let fields = vec![int_field("id")];
+        let batches = ParquetFormatReader::with_read_budget(Arc::clone(&budget))
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(Bytes::from(data))),
+                file_size,
+                &fields,
+                None,
+                Some(32),
+                Some(vec![RowRange::new(0, 9)]),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
+        let diagnostics = budget.diagnostics();
+        assert_eq!(diagnostics.row_group_count, 2);
+        assert!(diagnostics.projected_bytes_total > 0);
+        assert_eq!(diagnostics.peak_inflight, 0);
     }
 
     #[tokio::test]
