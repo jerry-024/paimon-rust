@@ -465,8 +465,8 @@ impl FormatFileReader for ParquetFormatReader {
             combined_selection =
                 intersect_optional_row_selections(combined_selection, Some(range_selection));
         }
-        if let Some(sel) = combined_selection {
-            batch_stream_builder = batch_stream_builder.with_row_selection(sel);
+        if let Some(ref selection) = combined_selection {
+            batch_stream_builder = batch_stream_builder.with_row_selection(selection.clone());
         }
         if let Some(size) = batch_size {
             batch_stream_builder = batch_stream_builder.with_batch_size(size);
@@ -505,10 +505,18 @@ impl FormatFileReader for ParquetFormatReader {
             .as_ref()
             .filter(|budget| row_group_parallelism > 1 || budget.diagnostics_enabled())
             .map(|budget| {
+                let mut diagnostic_selection = combined_selection;
                 let projected_bytes = batch_stream_builder
                     .metadata()
                     .row_groups()
                     .iter()
+                    .filter(|row_group| {
+                        diagnostic_selection.as_mut().is_none_or(|selection| {
+                            selection
+                                .split_off(row_group.num_rows() as usize)
+                                .selects_any()
+                        })
+                    })
                     .map(|row_group| projected_row_group_bytes(row_group, &mask))
                     .collect::<Vec<_>>();
                 budget.record_projected_row_groups(&projected_bytes);
@@ -2918,7 +2926,7 @@ mod tests {
 
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
         let diagnostics = budget.diagnostics();
-        assert_eq!(diagnostics.row_group_count, 2);
+        assert_eq!(diagnostics.row_group_count, 1);
         assert!(diagnostics.projected_bytes_total > 0);
         assert_eq!(diagnostics.peak_inflight, 0);
     }
