@@ -17,6 +17,7 @@
 
 //! Consumer progress manager for Java-compatible consumer files.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::io::FileIO;
@@ -54,17 +55,13 @@ impl ConsumerManager {
 
     /// Read one consumer's next snapshot id.
     pub async fn get(&self, consumer_id: &str) -> crate::Result<Option<i64>> {
-        // A listed consumer id is a single file name. Do not let a pushed SQL
-        // literal turn the direct-read optimization into path traversal.
-        if consumer_id.contains('/') {
-            return Ok(None);
-        }
-
-        let path = format!(
-            "{}/{}/{}{}",
-            self.table_path, CONSUMER_DIR, CONSUMER_PREFIX, consumer_id
-        );
-        self.read_path(consumer_id, &path).await
+        let ids = HashSet::from([consumer_id]);
+        Ok(self
+            .list_matching(Some(&ids))
+            .await?
+            .into_iter()
+            .next()
+            .map(|(_, next_snapshot)| next_snapshot))
     }
 
     async fn read_path(&self, consumer_id: &str, path: &str) -> crate::Result<Option<i64>> {
@@ -95,6 +92,19 @@ impl ConsumerManager {
 
     /// List consumer ids and their next snapshot ids, sorted by consumer id.
     pub async fn list_all(&self) -> crate::Result<Vec<(String, i64)>> {
+        self.list_matching(None).await
+    }
+
+    /// List the requested consumers that have exactly matching directory entries.
+    pub async fn list_by_ids(&self, consumer_ids: &[String]) -> crate::Result<Vec<(String, i64)>> {
+        let ids = consumer_ids.iter().map(String::as_str).collect();
+        self.list_matching(Some(&ids)).await
+    }
+
+    async fn list_matching(
+        &self,
+        consumer_ids: Option<&HashSet<&str>>,
+    ) -> crate::Result<Vec<(String, i64)>> {
         let directory = format!("{}/{}", self.table_path, CONSUMER_DIR);
         let statuses = match self.file_io.list_status(&directory).await {
             Ok(statuses) => statuses,
@@ -111,8 +121,11 @@ impl ConsumerManager {
                 return None;
             }
             let name = status.path.rsplit('/').next().unwrap_or(&status.path);
-            let id = name.strip_prefix(CONSUMER_PREFIX)?.to_string();
-            Some((id, status.path))
+            let id = name.strip_prefix(CONSUMER_PREFIX)?;
+            if consumer_ids.is_some_and(|ids| !ids.contains(id)) {
+                return None;
+            }
+            Some((id.to_string(), status.path))
         }))
         .map(|(id, path)| async move {
             self.read_path(&id, &path)

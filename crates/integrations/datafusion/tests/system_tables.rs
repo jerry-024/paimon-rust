@@ -578,10 +578,12 @@ async fn test_consumers_system_table() {
 
     // A filtered point lookup must not read unrelated consumer files.
     std::fs::write(consumer_dir.join("consumer-bad"), "{").unwrap();
-    let cases: [(&str, &[(&str, i64)]); 3] = [
+    let cases: [(&str, &[(&str, i64)]); 5] = [
         ("consumer_id = 'id1'", &[("id1", 5)]),
         ("consumer_id IN ('id2', 'missing')", &[("id2", 6)]),
         ("consumer_id = 'missing'", &[]),
+        ("consumer_id = 'id1 '", &[]),
+        ("consumer_id IN ('id1', 'id1 ')", &[("id1", 5)]),
     ];
     for (predicate, expected) in cases {
         let batches = run_sql(

@@ -75,16 +75,10 @@ impl TableProvider for ConsumersTable {
         let manager = self.table.consumer_manager();
         let requested_ids = requested_consumer_ids(filters);
         let consumers = crate::runtime::await_with_runtime(async move {
-            let Some(ids) = requested_ids else {
-                return manager.list_all().await;
-            };
-            let mut consumers = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(next_snapshot) = manager.get(&id).await? {
-                    consumers.push((id, next_snapshot));
-                }
+            match requested_ids {
+                Some(ids) => manager.list_by_ids(&ids).await,
+                None => manager.list_all().await,
             }
-            Ok(consumers)
         })
         .await
         .map_err(to_datafusion_error)?;
