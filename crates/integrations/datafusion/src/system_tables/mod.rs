@@ -142,6 +142,14 @@ pub(crate) async fn load(
     if !is_registered(&system_name) {
         return Ok(None);
     }
+    if system_name.eq_ignore_ascii_case("audit_log")
+        && paimon::spec::CoreOptions::new(&dynamic_options).table_read_sequence_number_enabled()
+    {
+        return Err(DataFusionError::Plan(
+            "table-read.sequence-number.enabled is not supported by dynamic options for $audit_log"
+                .to_string(),
+        ));
+    }
     let identifier = Identifier::new(database, object.table().to_string());
     match catalog.get_table(&identifier).await {
         Ok(mut table) => {

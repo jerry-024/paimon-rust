@@ -136,6 +136,36 @@ async fn test_query_auth_table_fails_closed() {
 }
 
 #[tokio::test]
+async fn test_audit_log_rejects_dynamic_sequence_number_option() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+    run_sql(
+        &ctx,
+        "CREATE TABLE paimon.default.audit_dynamic_sequence (
+            id INT NOT NULL,
+            PRIMARY KEY (id)
+        ) WITH ('bucket' = '1')",
+    )
+    .await;
+
+    run_sql(
+        &ctx,
+        "SET 'paimon.table-read.sequence-number.enabled' = 'true'",
+    )
+    .await;
+    let err = query_error(
+        &ctx,
+        "SELECT * FROM paimon.default.audit_dynamic_sequence$audit_log",
+    )
+    .await;
+    assert!(
+        err.contains("table-read.sequence-number.enabled")
+            && err.contains("not supported by dynamic options"),
+        "unexpected error: {err}"
+    );
+    run_sql(&ctx, "RESET 'paimon.table-read.sequence-number.enabled'").await;
+}
+
+#[tokio::test]
 async fn test_audit_log_respects_dynamic_time_travel() {
     let (ctx, _catalog, _tmp) = create_context().await;
     run_sql(&ctx, "CREATE TABLE paimon.default.audit_tt (id INT)").await;
