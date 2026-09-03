@@ -698,9 +698,6 @@ impl SchemaProvider for PaimonSchemaProvider {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            paimon::spec::CoreOptions::new(&dynamic_options)
-                .ensure_read_authorized()
-                .map_err(to_datafusion_error)?;
             return await_with_runtime(system_tables::load(
                 Arc::clone(&self.catalog),
                 self.database.clone(),

@@ -78,6 +78,16 @@ const SYSTEM_TABLE_NAMES: &[&str] = &[
     "tags",
 ];
 
+// Matches Java SystemTableLoader's physical-metadata restriction. Audit log is
+// also rejected until Rust can apply the base table's row filters and masks.
+const QUERY_AUTH_UNSUPPORTED_TABLES: &[&str] = &[
+    "audit_log",
+    "files",
+    "file_key_ranges",
+    "binlog",
+    "statistics",
+];
+
 /// Parse a Paimon object name into table, branch, and optional system table.
 ///
 /// Mirrors Java [Identifier.splitObjectName](https://github.com/apache/paimon/blob/release-1.3/paimon-api/src/main/java/org/apache/paimon/catalog/Identifier.java).
@@ -105,6 +115,21 @@ fn wrap_to_system_table(name: &str, base_table: Table) -> Option<DFResult<Arc<dy
         .map(|(_, build)| build(base_table))
 }
 
+fn ensure_system_table_read_supported(
+    options: &HashMap<String, String>,
+    name: &str,
+) -> DFResult<()> {
+    if QUERY_AUTH_UNSUPPORTED_TABLES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        paimon::spec::CoreOptions::new(options)
+            .ensure_read_authorized()
+            .map_err(to_datafusion_error)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn provider_for_table(
     catalog: Arc<dyn Catalog>,
     identifier: Identifier,
@@ -114,10 +139,7 @@ pub(crate) fn provider_for_table(
     if !is_registered(system_name) {
         return Ok(None);
     }
-    // Fail closed: system tables expose file metadata the client can't authorize.
-    paimon::spec::CoreOptions::new(table.schema().options())
-        .ensure_read_authorized()
-        .map_err(to_datafusion_error)?;
+    ensure_system_table_read_supported(table.schema().options(), system_name)?;
     if system_name.eq_ignore_ascii_case("partitions") {
         return partitions::build(catalog, identifier, table).map(Some);
     }
@@ -150,12 +172,11 @@ pub(crate) async fn load(
                 .to_string(),
         ));
     }
+    ensure_system_table_read_supported(&dynamic_options, &system_name)?;
     let identifier = Identifier::new(database, object.table().to_string());
     match catalog.get_table(&identifier).await {
         Ok(mut table) => {
-            paimon::spec::CoreOptions::new(table.schema().options())
-                .ensure_read_authorized()
-                .map_err(to_datafusion_error)?;
+            ensure_system_table_read_supported(table.schema().options(), &system_name)?;
             if let Some(branch) = object.branch() {
                 if !system_name.eq_ignore_ascii_case("branches") {
                     table = table
