@@ -20,10 +20,12 @@
 use std::time::Duration;
 
 use crate::io::FileIO;
+use futures::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
 const CONSUMER_DIR: &str = "consumer";
 const CONSUMER_PREFIX: &str = "consumer-";
+const CONSUMER_READ_CONCURRENCY: usize = 32;
 const READ_RETRIES: usize = 10;
 const RETRY_DELAY: Duration = Duration::from_millis(200);
 
@@ -62,7 +64,11 @@ impl ConsumerManager {
             "{}/{}/{}{}",
             self.table_path, CONSUMER_DIR, CONSUMER_PREFIX, consumer_id
         );
-        let input = self.file_io.new_input(&path)?;
+        self.read_path(consumer_id, &path).await
+    }
+
+    async fn read_path(&self, consumer_id: &str, path: &str) -> crate::Result<Option<i64>> {
+        let input = self.file_io.new_input(path)?;
         for attempt in 0..READ_RETRIES {
             let bytes = match input.read().await {
                 Ok(bytes) => bytes,
@@ -100,19 +106,25 @@ impl ConsumerManager {
             Err(error) => return Err(error),
         };
 
-        let mut consumers = Vec::new();
-        for status in statuses {
+        let mut consumers = stream::iter(statuses.into_iter().filter_map(|status| {
             if status.is_dir {
-                continue;
+                return None;
             }
             let name = status.path.rsplit('/').next().unwrap_or(&status.path);
-            let Some(id) = name.strip_prefix(CONSUMER_PREFIX) else {
-                continue;
-            };
-            if let Some(next_snapshot) = self.get(id).await? {
-                consumers.push((id.to_string(), next_snapshot));
-            }
-        }
+            let id = name.strip_prefix(CONSUMER_PREFIX)?.to_string();
+            Some((id, status.path))
+        }))
+        .map(|(id, path)| async move {
+            self.read_path(&id, &path)
+                .await
+                .map(|next_snapshot| next_snapshot.map(|next_snapshot| (id, next_snapshot)))
+        })
+        .buffer_unordered(CONSUMER_READ_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         consumers.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Ok(consumers)
     }
@@ -159,5 +171,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(read.await.unwrap(), Some(5));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn lists_posix_consumer_id_with_backslash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table_path = tmp.path().join("table");
+        let directory = table_path.join(CONSUMER_DIR);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(r"consumer-id\part"), r#"{"nextSnapshot":5}"#).unwrap();
+
+        let manager = ConsumerManager::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            format!("file://{}", table_path.display()),
+        );
+
+        assert_eq!(
+            manager.list_all().await.unwrap(),
+            vec![(r"id\part".to_string(), 5)]
+        );
+        assert_eq!(manager.get(r"id\part").await.unwrap(), Some(5));
     }
 }
