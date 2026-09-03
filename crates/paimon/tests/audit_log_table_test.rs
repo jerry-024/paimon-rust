@@ -320,6 +320,45 @@ async fn audit_log_exposes_sequence_number_when_enabled() {
     assert!(rows.iter().all(|(_, seq, _, _)| *seq >= 0));
 }
 
+#[tokio::test]
+async fn audit_log_current_scan_keeps_delete_and_sequence_number() {
+    let table_path = "memory:/audit_log/current_state";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "input"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+            ("table-read.sequence-number.enabled", "true"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
+    let builder = table.new_write_builder();
+    let mut write = builder.new_write().unwrap();
+    write
+        .write_arrow_batch(&make_batch_with_kinds(vec![1, 2], vec![10, 25], vec![3, 2]))
+        .await
+        .unwrap();
+    let messages = write.prepare_commit().await.unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = AuditLogTable::new(table)
+        .to_arrow_for_splits(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        collect_audit_rows_with_sequence(&batches),
+        vec![("+U".to_string(), 3, 2, 25), ("-D".to_string(), 2, 1, 10),]
+    );
+}
+
 async fn audit_diff_rows(
     table: &paimon::table::Table,
     start: i64,
@@ -354,6 +393,119 @@ fn assert_rows_exclude(rows: &[(String, i32, i32)], excluded: &[(&str, i32, i32)
             "unexpected rowkind={kind} id={id} value={value} in {rows:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn audit_log_current_scan_uses_merged_rowkind() {
+    for merge_engine in ["partial-update", "aggregation"] {
+        let table_path = format!("memory:/audit_log/current_{merge_engine}");
+        let (file_io, table) = memory_table(
+            &table_path,
+            pk_schema(&[("merge-engine", merge_engine), ("bucket", "1")]),
+        );
+        setup_dirs(&file_io, &table_path).await;
+        persist_table_schema(&file_io, &table_path, table.schema()).await;
+
+        write_batch(&table, &make_batch(vec![1], vec![10])).await;
+        let builder = table.new_write_builder();
+        let mut write = builder.new_write().unwrap();
+        write
+            .write_arrow_batch(&make_batch_with_kinds(vec![1], vec![20], vec![2]))
+            .await
+            .unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        builder.new_commit().commit(messages).await.unwrap();
+
+        let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = AuditLogTable::new(table)
+            .to_arrow_for_splits(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_audit_rows(&batches),
+            vec![("+I".to_string(), 1, 20)],
+            "merge-engine={merge_engine}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit_log_current_scan_respects_ignore_delete() {
+    let table_path = "memory:/audit_log/current_ignore_delete";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("merge-engine", "deduplicate"),
+            ("ignore-delete", "true"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    let builder = table.new_write_builder();
+    let mut write = builder.new_write().unwrap();
+    write
+        .write_arrow_batch(&make_batch_with_kinds(vec![1], vec![10], vec![3]))
+        .await
+        .unwrap();
+    let messages = write.prepare_commit().await.unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = AuditLogTable::new(table)
+        .to_arrow_for_splits(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        collect_audit_rows(&batches),
+        vec![("+I".to_string(), 1, 10)]
+    );
+}
+
+#[tokio::test]
+async fn audit_log_current_scan_supports_first_row() {
+    let table_path = "memory:/audit_log/current_first_row";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("merge-engine", "first-row"),
+            ("bucket", "1"),
+            ("source.split.target-size", "1b"),
+            ("source.split.open-file-cost", "1b"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![1], vec![20])).await;
+
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap();
+    assert_eq!(plan.splits().len(), 2);
+    let batches: Vec<RecordBatch> = AuditLogTable::new(table)
+        .to_arrow_for_splits(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        collect_audit_rows(&batches),
+        vec![("+I".to_string(), 1, 10)]
+    );
 }
 
 #[tokio::test]

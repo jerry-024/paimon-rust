@@ -356,19 +356,42 @@ impl PaimonScanBuilder<'_> {
         self,
         read_fields: Vec<DataField>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let (projected_schema, read_type) = if let Some(indices) = self.projection {
+        self.build_scan(read_fields, false)
+    }
+
+    pub(crate) fn build_audit_log(
+        self,
+        audit_fields: Vec<DataField>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.build_scan(audit_fields, true)
+    }
+
+    fn build_scan(
+        self,
+        read_fields: Vec<DataField>,
+        audit_log: bool,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let (projected_schema, mut read_type) = if let Some(indices) = self.projection {
             let fields: Vec<Field> = indices
                 .iter()
-                .map(|&i| self.schema.field(i).clone())
+                .map(|&index| self.schema.field(index).clone())
                 .collect();
             let read_type = indices
                 .iter()
-                .map(|&i| read_fields[i].clone())
-                .collect::<Vec<_>>();
+                .map(|&index| read_fields[index].clone())
+                .collect();
             (Arc::new(Schema::new(fields)), read_type)
         } else {
             (self.schema.clone(), read_fields)
         };
+        if audit_log {
+            read_type.retain(|field| {
+                !matches!(
+                    field.id(),
+                    paimon::spec::ROW_KIND_FIELD_ID | paimon::spec::SEQUENCE_NUMBER_FIELD_ID
+                )
+            });
+        }
 
         let splits = self.plan.into_splits();
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
@@ -381,18 +404,31 @@ impl PaimonScanBuilder<'_> {
                 .collect()
         };
 
-        Ok(Arc::new(PaimonTableScan::try_new(
-            projected_schema,
-            self.table.clone(),
-            read_type,
-            self.pushed_predicate,
-            planned_partitions,
-            self.limit,
-            self.filter_exact,
-            self.scan_trace,
-            None,
-            self.case_sensitive,
-        )?))
+        if audit_log {
+            Ok(Arc::new(PaimonTableScan::try_new_audit_log(
+                projected_schema,
+                self.table.clone(),
+                read_type,
+                self.pushed_predicate,
+                planned_partitions,
+                self.limit,
+                self.scan_trace,
+                self.case_sensitive,
+            )?))
+        } else {
+            Ok(Arc::new(PaimonTableScan::try_new(
+                projected_schema,
+                self.table.clone(),
+                read_type,
+                self.pushed_predicate,
+                planned_partitions,
+                self.limit,
+                self.filter_exact,
+                self.scan_trace,
+                None,
+                self.case_sensitive,
+            )?))
+        }
     }
 }
 

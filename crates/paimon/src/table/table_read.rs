@@ -39,6 +39,7 @@ use arrow_select::concat::concat as arrow_concat;
 use arrow_select::take::take;
 use futures::{stream, StreamExt};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const MAX_MERGE_INPUT_STREAMS: usize = 256;
@@ -213,6 +214,40 @@ impl<'a> TableRead<'a> {
         }
     }
 
+    /// Returns the current table state as audit-log rows for planned data splits.
+    pub fn to_audit_log_arrow_for_splits(
+        &self,
+        data_splits: &[DataSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.ensure_query_auth_allowed()?;
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.to_audit_log_arrow_for_splits(data_splits),
+            TableReadKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support audit log batch read".to_string(),
+            }),
+        }
+    }
+
+    /// As [`Self::to_audit_log_arrow_for_splits`], omitting unrequested system columns.
+    pub fn to_projected_audit_log_arrow_for_splits(
+        &self,
+        data_splits: &[DataSplit],
+        include_rowkind: bool,
+        include_sequence: bool,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.ensure_query_auth_allowed()?;
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.to_projected_audit_log_arrow_for_splits(
+                data_splits,
+                include_rowkind,
+                include_sequence,
+            ),
+            TableReadKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support audit log batch read".to_string(),
+            }),
+        }
+    }
+
     fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
         CoreOptions::new(self.table().schema().options()).ensure_read_authorized()
     }
@@ -357,6 +392,127 @@ impl<'a> PaimonTableRead<'a> {
         }))
     }
 
+    /// Returns the current table state as audit-log rows.
+    pub fn to_audit_log_arrow_for_splits(
+        &self,
+        data_splits: &[DataSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.to_projected_audit_log_arrow_for_splits(
+            data_splits,
+            true,
+            audit_sequence_number_enabled(self.table),
+        )
+    }
+
+    /// Returns projected current-state audit rows without materializing omitted system columns.
+    pub fn to_projected_audit_log_arrow_for_splits(
+        &self,
+        data_splits: &[DataSplit],
+        include_rowkind: bool,
+        include_sequence: bool,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        if include_sequence && !audit_sequence_number_enabled(self.table) {
+            return Err(crate::Error::DataInvalid {
+                message: "Audit read requested _SEQUENCE_NUMBER but table-read.sequence-number.enabled is false".to_string(),
+                source: None,
+            });
+        }
+        let user_read_type = self.read_type.clone();
+        let audit_schema =
+            audit_schema_for_read_type(&user_read_type, include_rowkind, include_sequence)?;
+        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
+
+        let physical_stream = if has_primary_keys {
+            let core_options = self.table.schema().core_options();
+            let mut read_type = Vec::with_capacity(user_read_type.len() + 2);
+            if include_sequence {
+                read_type.push(DataField::new(
+                    SEQUENCE_NUMBER_FIELD_ID,
+                    SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+                    DataType::BigInt(BigIntType::new()),
+                ));
+            }
+            if include_rowkind {
+                read_type.push(DataField::new(
+                    VALUE_KIND_FIELD_ID,
+                    VALUE_KIND_FIELD_NAME.to_string(),
+                    DataType::TinyInt(TinyIntType::new()),
+                ));
+            }
+            read_type.extend(user_read_type.iter().cloned());
+
+            let merge_engine = core_options.merge_engine()?;
+            let (raw_splits, merge_splits) = partition_audit_splits(data_splits, merge_engine);
+            let parquet_read_budget = self.parquet_read_budget()?;
+            let raw_stream = DataFileReader::new(
+                self.table.file_io.clone(),
+                self.table.schema_manager().clone(),
+                self.table.schema().id(),
+                self.table.schema.fields().to_vec(),
+                read_type.clone(),
+                self.data_predicates.clone(),
+            )
+            .with_batch_size(Some(core_options.read_batch_size()?))
+            .with_parquet_read_budget(Some(Arc::clone(&parquet_read_budget)))
+            .read(&raw_splits)?;
+            let merge_reader = KeyValueFileReader::new(
+                self.table.file_io.clone(),
+                KeyValueReadConfig {
+                    table_name: self.table.identifier().full_name(),
+                    table_options: self.table.schema().options().clone(),
+                    schema_manager: self.table.schema_manager().clone(),
+                    table_schema_id: self.table.schema().id(),
+                    table_fields: self.table.schema.fields().to_vec(),
+                    read_type,
+                    predicates: self.data_predicates.clone(),
+                    primary_keys: self.table.schema.trimmed_primary_keys(),
+                    merge_engine,
+                    sequence_fields: core_options
+                        .sequence_fields()
+                        .iter()
+                        .map(|field| field.to_string())
+                        .collect(),
+                    read_batch_size: core_options.read_batch_size()?,
+                    keep_delete: true,
+                    merge_splits: merge_engine == MergeEngine::FirstRow,
+                    max_merge_input_streams: Some(MAX_MERGE_INPUT_STREAMS),
+                    parquet_read_budget: Some(parquet_read_budget),
+                },
+            );
+            let merge_stream = if merge_engine == MergeEngine::FirstRow {
+                let mut groups: HashMap<(Vec<u8>, i32), Vec<DataSplit>> = HashMap::new();
+                for split in merge_splits {
+                    groups
+                        .entry((split.partition().to_serialized_bytes(), split.bucket()))
+                        .or_default()
+                        .push(split);
+                }
+                Box::pin(async_stream::try_stream! {
+                    for splits in groups.into_values() {
+                        let mut group_stream = merge_reader.clone().read(&splits)?;
+                        while let Some(batch) = group_stream.next().await {
+                            yield batch?;
+                        }
+                    }
+                }) as ArrowRecordBatchStream
+            } else {
+                merge_reader.read(&merge_splits)?
+            };
+            Box::pin(stream::select_all([raw_stream, merge_stream]))
+        } else {
+            self.to_arrow(data_splits)?
+        };
+
+        Ok(audit_stream_from_physical(
+            physical_stream,
+            audit_schema,
+            user_read_type,
+            include_rowkind,
+            include_sequence,
+            has_primary_keys && include_rowkind,
+        ))
+    }
+
     /// Returns an audit-log stream for a planned incremental scan.
     pub fn to_audit_log_arrow(
         &self,
@@ -385,7 +541,7 @@ impl<'a> PaimonTableRead<'a> {
         let data_splits = plan.data_splits();
         let user_read_type = self.read_type.clone();
         let include_sequence = audit_sequence_number_enabled(self.table);
-        let audit_schema = audit_schema_for_read_type(&user_read_type, include_sequence)?;
+        let audit_schema = audit_schema_for_read_type(&user_read_type, true, include_sequence)?;
 
         let mut read_type = user_read_type.clone();
         if include_sequence {
@@ -417,54 +573,14 @@ impl<'a> PaimonTableRead<'a> {
         .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?))
         .with_parquet_read_budget(Some(self.parquet_read_budget()?));
         let raw_stream = reader.read(&data_splits)?;
-
-        Ok(Box::pin(async_stream::try_stream! {
-            futures::pin_mut!(raw_stream);
-            while let Some(batch) = raw_stream.next().await {
-                let batch = batch?;
-                let rowkind_col: ArrayRef = if has_value_kind {
-                    let col = batch
-                        .column_by_name(VALUE_KIND_FIELD_NAME)
-                        .ok_or_else(|| crate::Error::DataInvalid {
-                            message: "Changelog audit read missing _VALUE_KIND column".to_string(),
-                            source: None,
-                        })?;
-                    Arc::new(rowkind_array_from_column(col)?)
-                } else {
-                    let inserts: Vec<&'static str> = (0..batch.num_rows()).map(|_| "+I").collect();
-                    Arc::new(StringArray::from(inserts))
-                };
-
-                let mut columns: Vec<ArrayRef> = vec![rowkind_col];
-                if include_sequence {
-                    let seq_col = batch
-                        .column_by_name(SEQUENCE_NUMBER_FIELD_NAME)
-                        .ok_or_else(|| crate::Error::DataInvalid {
-                            message: "Audit read missing _SEQUENCE_NUMBER column".to_string(),
-                            source: None,
-                        })?;
-                    columns.push(seq_col.clone());
-                }
-                for field in &user_read_type {
-                    let col = batch
-                        .column_by_name(field.name())
-                        .ok_or_else(|| crate::Error::DataInvalid {
-                            message: format!(
-                                "Audit read missing column '{}'",
-                                field.name()
-                            ),
-                            source: None,
-                        })?;
-                    columns.push(col.clone());
-                }
-                yield RecordBatch::try_new(audit_schema.clone(), columns).map_err(|e| {
-                    crate::Error::UnexpectedError {
-                        message: format!("Failed to build audit log batch: {e}"),
-                        source: Some(Box::new(e)),
-                    }
-                })?;
-            }
-        }))
+        Ok(audit_stream_from_physical(
+            raw_stream,
+            audit_schema,
+            user_read_type,
+            true,
+            include_sequence,
+            has_value_kind,
+        ))
     }
 
     fn audit_diff_stream(&self, plan: &IncrementalPlan) -> crate::Result<ArrowRecordBatchStream> {
@@ -505,7 +621,7 @@ impl<'a> PaimonTableRead<'a> {
         after: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
         let include_sequence = audit_sequence_number_enabled(self.table);
-        let audit_schema = audit_schema_for_read_type(&self.read_type, include_sequence)?;
+        let audit_schema = audit_schema_for_read_type(&self.read_type, true, include_sequence)?;
 
         let mut diff_read_type = self.table.schema().fields().to_vec();
         ensure_diff_supported_read_type(&diff_read_type)?;
@@ -701,6 +817,7 @@ impl<'a> PaimonTableRead<'a> {
                     .map(|s| s.to_string())
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
+                keep_delete: false,
                 merge_splits: true,
                 max_merge_input_streams: Some(MAX_MERGE_INPUT_STREAMS),
                 // Diff primes the before and after streams in sequence. Keeping
@@ -842,6 +959,7 @@ impl<'a> PaimonTableRead<'a> {
                     .map(|s| s.to_string())
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
+                keep_delete: false,
                 merge_splits: false,
                 max_merge_input_streams: (core_options.deletion_vectors_enabled()
                     && core_options.deletion_vectors_merge_on_read())
@@ -906,16 +1024,158 @@ impl<'a> PaimonTableRead<'a> {
     }
 }
 
+// Legacy unknown delete counts and first-row level-0 files stay on the merge path.
+fn audit_raw_convertible(split: &DataSplit, merge_engine: MergeEngine) -> bool {
+    split.raw_convertible()
+        && split.data_files().iter().all(|file| {
+            file.delete_row_count == Some(0)
+                && (merge_engine != MergeEngine::FirstRow || file.level != 0)
+        })
+}
+
+fn partition_audit_splits(
+    data_splits: &[DataSplit],
+    merge_engine: MergeEngine,
+) -> (Vec<DataSplit>, Vec<DataSplit>) {
+    if merge_engine != MergeEngine::FirstRow {
+        return data_splits
+            .iter()
+            .cloned()
+            .partition(|split| audit_raw_convertible(split, merge_engine));
+    }
+
+    let mut groups: HashMap<(Vec<u8>, i32), Vec<DataSplit>> = HashMap::new();
+    for split in data_splits.iter().cloned() {
+        groups
+            .entry((split.partition().to_serialized_bytes(), split.bucket()))
+            .or_default()
+            .push(split);
+    }
+    let mut raw = Vec::new();
+    let mut merge = Vec::new();
+    for group in groups.into_values() {
+        if group
+            .iter()
+            .all(|split| audit_raw_convertible(split, merge_engine))
+        {
+            raw.extend(group);
+        } else {
+            merge.extend(group);
+        }
+    }
+    (raw, merge)
+}
+
+struct AuditPhysicalProjection {
+    value_kind: Option<usize>,
+    sequence: Option<usize>,
+    user: Vec<usize>,
+}
+
+fn audit_physical_projection(
+    schema: &ArrowSchema,
+    user_read_type: &[DataField],
+    include_rowkind: bool,
+    include_sequence: bool,
+    has_value_kind: bool,
+) -> crate::Result<AuditPhysicalProjection> {
+    let by_name: HashMap<&str, usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| (field.name().as_str(), index))
+        .collect();
+    let index = |name: &str| {
+        by_name
+            .get(name)
+            .copied()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("Audit read missing column '{name}'"),
+                source: None,
+            })
+    };
+    Ok(AuditPhysicalProjection {
+        value_kind: (include_rowkind && has_value_kind)
+            .then(|| index(VALUE_KIND_FIELD_NAME))
+            .transpose()?,
+        sequence: include_sequence
+            .then(|| index(SEQUENCE_NUMBER_FIELD_NAME))
+            .transpose()?,
+        user: user_read_type
+            .iter()
+            .map(|field| index(field.name()))
+            .collect::<crate::Result<Vec<_>>>()?,
+    })
+}
+
+fn audit_stream_from_physical(
+    raw_stream: ArrowRecordBatchStream,
+    audit_schema: Arc<ArrowSchema>,
+    user_read_type: Vec<DataField>,
+    include_rowkind: bool,
+    include_sequence: bool,
+    has_value_kind: bool,
+) -> ArrowRecordBatchStream {
+    Box::pin(async_stream::try_stream! {
+        futures::pin_mut!(raw_stream);
+        let mut projection = None;
+        while let Some(batch) = raw_stream.next().await {
+            let batch = batch?;
+            if projection.is_none() {
+                projection = Some(audit_physical_projection(
+                    batch.schema().as_ref(),
+                    &user_read_type,
+                    include_rowkind,
+                    include_sequence,
+                    has_value_kind,
+                )?);
+            }
+            let projection = projection.as_ref().unwrap();
+            let mut columns = Vec::with_capacity(audit_schema.fields().len());
+            if include_rowkind {
+                let rowkind_col: ArrayRef = if let Some(index) = projection.value_kind {
+                    Arc::new(rowkind_array_from_column(batch.column(index).as_ref())?)
+                } else {
+                    Arc::new(StringArray::from(vec!["+I"; batch.num_rows()]))
+                };
+                columns.push(rowkind_col);
+            }
+            if let Some(index) = projection.sequence {
+                columns.push(batch.column(index).clone());
+            }
+            columns.extend(
+                projection
+                    .user
+                    .iter()
+                    .map(|&index| batch.column(index).clone()),
+            );
+            let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+            yield RecordBatch::try_new_with_options(
+                audit_schema.clone(),
+                columns,
+                &options,
+            )
+            .map_err(|error| crate::Error::UnexpectedError {
+                message: format!("Failed to build audit log batch: {error}"),
+                source: Some(Box::new(error)),
+            })?;
+        }
+    })
+}
+
 fn audit_schema_for_read_type(
     read_type: &[DataField],
+    include_rowkind: bool,
     include_sequence: bool,
 ) -> crate::Result<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(read_type.len() + 2);
-    fields.push(DataField::new(
-        ROW_KIND_FIELD_ID,
-        ROW_KIND_FIELD_NAME.to_string(),
-        DataType::VarChar(crate::spec::VarCharType::string_type()),
-    ));
+    if include_rowkind {
+        fields.push(DataField::new(
+            ROW_KIND_FIELD_ID,
+            ROW_KIND_FIELD_NAME.to_string(),
+            DataType::VarChar(crate::spec::VarCharType::string_type()),
+        ));
+    }
     if include_sequence {
         fields.push(DataField::new(
             SEQUENCE_NUMBER_FIELD_ID,
@@ -930,9 +1190,8 @@ fn audit_schema_for_read_type(
 fn audit_sequence_number_enabled(table: &Table) -> bool {
     table
         .schema()
-        .options()
-        .get("table-read.sequence-number.enabled")
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        .core_options()
+        .table_read_sequence_number_enabled()
 }
 
 fn rowkind_array_from_column(column: &dyn arrow_array::Array) -> crate::Result<StringArray> {
@@ -1556,6 +1815,20 @@ mod tests {
         // may hide delete rows, so it must go through the merge reader.
         let legacy = split(vec![file("a", 5, None)], true);
         assert!(pk_split_needs_merge(&legacy, false));
+
+        assert!(audit_raw_convertible(&raw, MergeEngine::Deduplicate));
+        assert!(audit_raw_convertible(&raw, MergeEngine::FirstRow));
+        assert!(!audit_raw_convertible(&merge, MergeEngine::Deduplicate));
+        assert!(!audit_raw_convertible(&legacy, MergeEngine::Deduplicate));
+        let level_zero = split(vec![file("a", 0, Some(0))], true);
+        assert!(audit_raw_convertible(&level_zero, MergeEngine::Deduplicate));
+        assert!(!audit_raw_convertible(&level_zero, MergeEngine::FirstRow));
+        let (raw_only, merge_only) =
+            partition_audit_splits(std::slice::from_ref(&raw), MergeEngine::FirstRow);
+        assert_eq!((raw_only.len(), merge_only.len()), (1, 0));
+        let (raw_group, merge_group) =
+            partition_audit_splits(&[raw.clone(), level_zero], MergeEngine::FirstRow);
+        assert_eq!((raw_group.len(), merge_group.len()), (0, 2));
 
         // Deletion-vector tables dispatch on level 0 only.
         let dv_l0 = split(vec![file("a", 0, None)], false);

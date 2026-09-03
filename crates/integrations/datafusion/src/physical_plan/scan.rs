@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::BooleanArray;
 use datafusion::arrow::compute::{cast, filter_record_batch};
 use datafusion::arrow::datatypes::{
-    DataType as ArrowDataType, SchemaRef as ArrowSchemaRef, TimeUnit,
+    DataType as ArrowDataType, Schema, SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
@@ -50,12 +51,62 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use paimon::arrow::ParquetReadBudget;
-use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator};
+use paimon::spec::{
+    DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator,
+    ROW_KIND_FIELD_NAME, SEQUENCE_NUMBER_FIELD_NAME,
+};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::scalar_to_datum;
+
+struct AuditProjection {
+    indices: Vec<usize>,
+    schema: ArrowSchemaRef,
+}
+
+fn audit_projection(batch: &RecordBatch, schema: &ArrowSchemaRef) -> DFResult<AuditProjection> {
+    let batch_schema = batch.schema();
+    let by_name: HashMap<&str, usize> = batch_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| (field.name().as_str(), index))
+        .collect();
+    let indices = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            by_name.get(field.name().as_str()).copied().ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "Audit log reader did not return projected column '{}'",
+                    field.name()
+                ))
+            })
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    let fields = indices
+        .iter()
+        .map(|&index| batch.schema().field(index).clone())
+        .collect::<Vec<_>>();
+    Ok(AuditProjection {
+        indices,
+        schema: Arc::new(Schema::new(fields)),
+    })
+}
+
+fn project_audit_batch(batch: RecordBatch, projection: &AuditProjection) -> DFResult<RecordBatch> {
+    let row_count = batch.num_rows();
+    let columns = projection
+        .indices
+        .iter()
+        .map(|&index| batch.column(index).clone())
+        .collect();
+    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+    RecordBatch::try_new_with_options(projection.schema.clone(), columns, &options)
+        .map_err(Into::into)
+}
 
 fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
@@ -778,6 +829,8 @@ pub struct PaimonTableScan {
     decoder_filters: Vec<Arc<dyn PhysicalExpr>>,
     /// Query-wide budget shared by every DataFusion scan partition.
     parquet_read_budget: Arc<ParquetReadBudget>,
+    /// Retain retract rows and expose their row kind through `$audit_log`.
+    audit_log: bool,
 }
 
 impl PaimonTableScan {
@@ -884,7 +937,35 @@ impl PaimonTableScan {
             runtime_filters: Vec::new(),
             decoder_filters: Vec::new(),
             parquet_read_budget,
+            audit_log: false,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_audit_log(
+        schema: ArrowSchemaRef,
+        table: Table,
+        read_type: Vec<DataField>,
+        pushed_predicate: Option<Predicate>,
+        planned_partitions: Vec<Arc<[DataSplit]>>,
+        limit: Option<usize>,
+        scan_trace: Option<ScanTrace>,
+        case_sensitive: bool,
+    ) -> DFResult<Self> {
+        let mut scan = Self::try_new(
+            schema,
+            table,
+            read_type,
+            pushed_predicate,
+            planned_partitions,
+            limit,
+            false,
+            scan_trace,
+            None,
+            case_sensitive,
+        )?;
+        scan.audit_log = true;
+        Ok(scan)
     }
 
     pub fn table(&self) -> &Table {
@@ -973,7 +1054,11 @@ impl PaimonTableScan {
 
 impl ExecutionPlan for PaimonTableScan {
     fn name(&self) -> &str {
-        "PaimonTableScan"
+        if self.audit_log {
+            "PaimonAuditLogScan"
+        } else {
+            "PaimonTableScan"
+        }
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1007,13 +1092,23 @@ impl ExecutionPlan for PaimonTableScan {
                 Vec::new(),
             ));
         }
-
         let schema = self.schema();
         let mut accepted = Vec::new();
         let parent_filter_handled = filters
             .into_iter()
             .map(|filter| {
-                if can_expr_be_pushed_down_with_schemas(&filter, schema.as_ref()) {
+                let physical_columns_available = !self.audit_log
+                    || collect_columns(&filter).iter().all(|column| {
+                        resolve_physical_field(
+                            column.name(),
+                            self.table.schema().fields(),
+                            self.case_sensitive,
+                        )
+                        .is_some()
+                    });
+                if physical_columns_available
+                    && can_expr_be_pushed_down_with_schemas(&filter, schema.as_ref())
+                {
                     accepted.push(filter);
                     // This scan evaluates accepted expressions exactly, so the
                     // parent FilterExec can be removed.
@@ -1072,6 +1167,7 @@ impl ExecutionPlan for PaimonTableScan {
         let runtime_filters = self.runtime_filters.clone();
         let decoder_filters = self.decoder_filters.clone();
         let parquet_read_budget = Arc::clone(&self.parquet_read_budget);
+        let audit_log = self.audit_log;
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -1098,12 +1194,35 @@ impl ExecutionPlan for PaimonTableScan {
                     Arc::clone(&schema),
                 )));
             }
-            let stream = read.to_arrow(&splits).map_err(to_datafusion_error)?;
+            let stream = if audit_log {
+                read.to_projected_audit_log_arrow_for_splits(
+                    &splits,
+                    schema
+                        .fields()
+                        .iter()
+                        .any(|field| field.name() == ROW_KIND_FIELD_NAME),
+                    schema
+                        .fields()
+                        .iter()
+                        .any(|field| field.name() == SEQUENCE_NUMBER_FIELD_NAME),
+                )
+            } else {
+                read.to_arrow(&splits)
+            }
+            .map_err(to_datafusion_error)?;
             let batch_schema = Arc::clone(&schema);
+            let mut cached_audit_projection = None;
             let stream = stream.map(move |result| {
-                let mut batch = result
-                    .map_err(to_datafusion_error)
-                    .and_then(|batch| to_datafusion_batch(batch, &batch_schema))?;
+                let batch = result.map_err(to_datafusion_error)?;
+                let batch = if audit_log {
+                    if cached_audit_projection.is_none() {
+                        cached_audit_projection = Some(audit_projection(&batch, &batch_schema)?);
+                    }
+                    project_audit_batch(batch, cached_audit_projection.as_ref().unwrap())?
+                } else {
+                    batch
+                };
+                let mut batch = to_datafusion_batch(batch, &batch_schema)?;
                 // The decoder hook is an optimization and may be unavailable
                 // for a file/path. Retain every original live expression as
                 // the exact fallback; evaluating it on decoder survivors is
@@ -1159,7 +1278,9 @@ impl ExecutionPlan for PaimonTableScan {
         // 1. All splits have known merged_row_count (no deletion files with unknown cardinality)
         // 2. No limit is applied (limit would make row count inexact)
         // 3. Filter is exact (no residual filtering needed above the scan)
-        let num_rows_precision = if all_row_counts_known
+        let num_rows_precision = if self.audit_log {
+            Precision::Absent
+        } else if all_row_counts_known
             && self.limit.is_none()
             && self.filter_exact
             && self.runtime_filters.is_empty()
@@ -1183,7 +1304,7 @@ impl DisplayAs for PaimonTableScan {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "PaimonTableScan: table={}", self.table.identifier())?;
+        write!(f, "{}: table={}", self.name(), self.table.identifier())?;
 
         let total_splits: usize = self.planned_partitions.iter().map(|p| p.len()).sum();
         let total_files: usize = self
